@@ -23,11 +23,11 @@ void delay_u(uint16_t us) {
 // Writes `len` bytes from `data` with no read-back.
 
 void spi_write_array(uint8_t len, uint8_t* data) {
-    ltc_spi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
     for (uint8_t i = 0; i < len; i++) {
-        ltc_spi.transfer(data[i]);
+        SPI.transfer(data[i]);
     }
-    ltc_spi.endTransaction();
+    SPI.endTransaction();
 }
 
 // SPI write then read 
@@ -35,22 +35,22 @@ void spi_write_array(uint8_t len, uint8_t* data) {
 
 void spi_write_read(uint8_t* tx_data, uint8_t tx_len,
                     uint8_t* rx_data, uint8_t rx_len) {
-    ltc_spi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
     for (uint8_t i = 0; i < tx_len; i++) {
-        ltc_spi.transfer(tx_data[i]);
+        SPI.transfer(tx_data[i]);
     }
     for (uint8_t i = 0; i < rx_len; i++) {
-        rx_data[i] = ltc_spi.transfer(0xFF);
+        rx_data[i] = SPI.transfer(0xFF);
     }
-    ltc_spi.endTransaction();
+    SPI.endTransaction();
 }
 
 // SPI read single byte 
 // Used by LTC681x_pollAdc() to check the SDO line.
 
 uint8_t spi_read_byte(uint8_t tx_data) {
-    ltc_spi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-    uint8_t rx = ltc_spi.transfer(tx_data);
-    ltc_spi.endTransaction();
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+    uint8_t rx = SPI.transfer(tx_data);
+    SPI.endTransaction();
     return rx;
 }
