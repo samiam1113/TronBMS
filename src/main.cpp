@@ -16,6 +16,63 @@
 static cell_asic BMS_IC[TOTAL_IC];
 
 // ── Helpers ──────────────────────────────────────────────────
+#define ALTERNATE_PINS
+
+#define VSPI_MISO 19
+#define VSPI_MOSI 23
+#define VSPI_SCLK 18
+#define VSPI_SS   -1   // ADS131M02-Q1: single device, CS tied to GND
+
+#define HSPI_MISO 12
+#define HSPI_MOSI 13
+#define HSPI_SCLK 14
+#define HSPI_SS   4    // LTC6811-1 chip select
+
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+  #define VSPI FSPI
+#endif
+
+// LTC6811-1: max SPI clock is 1 MHz
+// ADS131M02-Q1: max SPI clock is 25 MHz, using 1 MHz for safety
+static const int spiClk = 1000000;  // 1 MHz
+
+SPIClass *vspi = NULL;
+SPIClass *hspi = NULL;
+
+// ── LTC6811-1 wakeup ────────────────────────────────────────────────────────
+// Step 1: Toggle CS low for >10us to exit SLEEP state (datasheet p.24)
+// Step 2: Send 0xFF dummy byte to exit IDLE state and clock the isoSPI core
+void wakeupLTC6811() {
+
+  // Wake from SLEEP — CS pulse must be held low for at least 10us
+  digitalWrite(HSPI_SS, LOW);
+  delayMicroseconds(300);   // 300us >> 10us minimum, covers worst-case tWAKE
+  digitalWrite(HSPI_SS, HIGH);
+  delayMicroseconds(10);    // tREADY: wait for LTC to be ready (~10us typical)
+
+  // Wake from IDLE — send a dummy byte to clock the isoSPI interface
+  hspi->beginTransaction(SPISettings(spiClk, MSBFIRST, SPI_MODE3)); // LTC6811 uses SPI Mode 3
+  digitalWrite(HSPI_SS, LOW);
+  hspi->transfer(0xFF);     // Dummy byte — no meaningful command, just clocks isoSPI
+  digitalWrite(HSPI_SS, HIGH);
+  hspi->endTransaction();
+
+  delayMicroseconds(10);    // Allow isoSPI to stabilise before next command
+}
+
+// ── ADS131M02-Q1 wakeup ─────────────────────────────────────────────────────
+// Send the WAKEUP command word 0x0033 as a 16-bit transfer (datasheet p.65)
+// ADS131M02-Q1 uses SPI Mode 1 (CPOL=0, CPHA=1)
+// Device exits standby and resumes conversions after receiving this command
+// void wakeupADS131M02() {
+//   vspi->beginTransaction(SPISettings(spiClk, MSBFIRST, SPI_MODE1)); // ADS131M02 uses SPI Mode 1
+//   vspi->transfer16(0x0033); // WAKEUP command word per datasheet Table 13
+//   vspi->endTransaction();
+
+//   delayMicroseconds(5);     // Wait for device to resume — tSETTLE not specified, 5us is safe
+// }
+
+
 
 static void println_sep(const char* label) {
     Serial.println();
@@ -34,23 +91,11 @@ static void printResult(const char* name, bool pass, const char* detail = "") {
 bool test_ltc_comms() {
     println_sep("STAGE 1: SPI Comms + PEC");
 
-    // Init SPI via LT_SPI layer — sets up HSPI on correct pins
-    quikeval_SPI_init();
+
     LTC6811_init_reg_limits(TOTAL_IC, BMS_IC);
 
-    // Manual wake pulse — CS low 500us, well above 10us minimum
-    Serial.println(F("  Manual wake pulse..."));
-    digitalWrite(LTC_CS_PIN, LOW);
-    delayMicroseconds(500);
-    digitalWrite(LTC_CS_PIN, HIGH);
-    delay(10);
+    wakeupLTC6811();
 
-    // Software wake — two pulses ensures isoSPI chain is awake
-    Serial.println(F("  Software wake..."));
-    wakeup_sleep(TOTAL_IC);
-    delay(10);
-    wakeup_sleep(TOTAL_IC);
-    delay(10);
 
     // Write UV/OV thresholds
     for (uint8_t i = 0; i < TOTAL_IC; i++) {
@@ -96,14 +141,14 @@ bool test_ltc_comms() {
 void test_ltc_voltages() {
     println_sep("STAGE 2: Cell Voltage Read");
 
-    wakeup_sleep(TOTAL_IC);
+    wakeupLTC6811();
     delay(10);
 
     LTC6811_adcv(MD_7KHZ_3KHZ, DCP_DISABLED, CELL_CH_ALL);
     LTC6811_pollAdc();
     delay(5);
 
-    int8_t pec = LTC6811_rdcv(REG_ALL, TOTAL_IC, BMS_IC);
+    int8_t pec = LTC6811_rdcv(0, TOTAL_IC, BMS_IC);
 
     char buf[48];
     snprintf(buf, sizeof(buf), "PEC=%d", pec);
@@ -158,19 +203,25 @@ void test_ltc_voltages() {
 // ── Entry points ─────────────────────────────────────────────
 
 void setup() {
-    // Deassert CS immediately on boot before any library code runs
+    // Deassert CS immediately — before any library code
     pinMode(LTC_CS_PIN, OUTPUT);
     digitalWrite(LTC_CS_PIN, HIGH);
 
     Serial.begin(115200);
     delay(500);
+
+    // Init both SPI buses
+    vspi = new SPIClass(VSPI);
+    hspi = new SPIClass(HSPI);
+
+    vspi->begin(VSPI_SCLK, VSPI_MISO, VSPI_MOSI, VSPI_SS);
+    hspi->begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, HSPI_SS);
+
+    pinMode(HSPI_SS, OUTPUT);
+    digitalWrite(HSPI_SS, HIGH);
+
     Serial.println(F("LTC6811 COMMS + VOLTAGE TEST"));
     Serial.println(F("============================"));
-    Serial.print  (F("TOTAL_IC = ")); Serial.println(TOTAL_IC);
-    Serial.print  (F("Pins: SCLK=")); Serial.print(LTC_SCLK_PIN);
-    Serial.print  (F(" MISO="));      Serial.print(LTC_MISO_PIN);
-    Serial.print  (F(" MOSI="));      Serial.print(LTC_MOSI_PIN);
-    Serial.print  (F(" CS="));        Serial.println(LTC_CS_PIN);
     Serial.println(F("\nSend any key to run..."));
 }
 
@@ -185,6 +236,7 @@ void loop() {
         Serial.println(F("\n  Skipping voltage read — fix comms first."));
     }
 
+    // spi_disable() is fine now — it just calls hspi->end()
     spi_disable();
     Serial.println(F("\n=== Test complete. Send any key to repeat. ==="));
 }

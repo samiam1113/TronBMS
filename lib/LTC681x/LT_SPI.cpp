@@ -14,56 +14,49 @@ Original Copyright 2018(c) Analog Devices, Inc. All rights reserved.
 #include "bms_config.h"
 
 // HSPI instance — extern so bms_hardware.cpp and main can share it
-SPIClass ltc_spi(HSPI);
+// Add near the top, after the #includes
+extern SPIClass *hspi;
 
-// Reads and sends a byte
 void spi_transfer_byte(uint8_t cs_pin, uint8_t tx, uint8_t *rx)
 {
+    hspi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
     output_low(cs_pin);
-    *rx = ltc_spi.transfer(tx);
+    *rx = hspi->transfer(tx);
     output_high(cs_pin);
+    hspi->endTransaction();
 }
 
-// Reads and sends a word
 void spi_transfer_word(uint8_t cs_pin, uint16_t tx, uint16_t *rx)
 {
-    union { uint8_t b[2]; uint16_t w; } data_tx;
-    union { uint8_t b[2]; uint16_t w; } data_rx;
+    union { uint8_t b[2]; uint16_t w; } data_tx, data_rx;
     data_tx.w = tx;
-
+    hspi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
     output_low(cs_pin);
-    data_rx.b[1] = ltc_spi.transfer(data_tx.b[1]);
-    data_rx.b[0] = ltc_spi.transfer(data_tx.b[0]);
+    data_rx.b[1] = hspi->transfer(data_tx.b[1]);
+    data_rx.b[0] = hspi->transfer(data_tx.b[0]);
     *rx = data_rx.w;
     output_high(cs_pin);
+    hspi->endTransaction();
 }
 
-// Reads and sends a byte array
 void spi_transfer_block(uint8_t cs_pin, uint8_t *tx, uint8_t *rx, uint8_t length)
 {
+    hspi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
     output_low(cs_pin);
     for (int8_t i = (length - 1); i >= 0; i--)
-        rx[i] = ltc_spi.transfer(tx[i]);
+        rx[i] = hspi->transfer(tx[i]);
     output_high(cs_pin);
+    hspi->endTransaction();
 }
 
-// Initialise HSPI on LTC pins at 1MHz MODE3
-// Called once before any LTC communication
 void spi_enable(uint8_t spi_clock_divider)
 {
-    // cs_pin and SCLK idle state setup
-    pinMode(LTC_CS_PIN,   OUTPUT); digitalWrite(LTC_CS_PIN,   HIGH);
-    pinMode(LTC_SCLK_PIN, OUTPUT); digitalWrite(LTC_SCLK_PIN, HIGH); // MODE3 idle high
-
-    // -1 for CS: LTC681x library manages CS manually via cs_low()/cs_high()
-    ltc_spi.begin(LTC_SCLK_PIN, LTC_MISO_PIN, LTC_MOSI_PIN, -1);
-    ltc_spi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+    hspi->begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, HSPI_SS);
 }
 
 void spi_disable()
 {
-    ltc_spi.endTransaction();
-    ltc_spi.end();
+    hspi->end();
 }
 
 void spi_write(int8_t data)
