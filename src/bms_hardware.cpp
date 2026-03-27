@@ -1,55 +1,72 @@
+/*!
+bms_hardware.cpp - Hardware abstraction layer for LTC681x on ESP32.
+Adapted from Linduino/ADI reference for ESP32 HSPI peripheral.
+
+Original Copyright 2018(c) Analog Devices, Inc. All rights reserved.
+*/
+
 #include <Arduino.h>
+#include <stdint.h>
 #include <SPI.h>
+#include "bms_hardware.h"
 #include "bms_config.h"
+#include "Linduino.h"
+#include "LT_SPI.h"
 
+// ltc_spi is defined in LT_SPI.cpp
+extern SPIClass ltc_spi;
 
-void cs_low(uint8_t /*pin*/) {
-    digitalWrite(LTC_CS_PIN, LOW);
+// CS control — LTC681x library calls these with CS_PIN from LTC681x.h
+// which is defined as LTC_CS_PIN in bms_config.h
+void cs_low(uint8_t pin)
+{
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
 }
 
-void cs_high(uint8_t /*pin*/) {
-    digitalWrite(LTC_CS_PIN, HIGH);
+void cs_high(uint8_t pin)
+{
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH);
 }
 
-// Delay 
-// delay_u is used for the isoSPI wake-up pulse timing (µs).
-
-void delay_u(uint16_t us) {
-    delayMicroseconds(us);
+void delay_u(uint16_t micro)
+{
+    delayMicroseconds(micro);
 }
 
-// SPI write array 
-// Writes `len` bytes from `data` with no read-back.
+void delay_m(uint16_t milli)
+{
+    delay(milli);
+}
 
-void spi_write_array(uint8_t len, uint8_t* data) {
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-    for (uint8_t i = 0; i < len; i++) {
-        SPI.transfer(data[i]);
+// Writes len bytes from data[] over SPI with no readback
+// CS is managed by the caller (LTC681x.cpp calls cs_low before this)
+void spi_write_array(uint8_t len, uint8_t data[])
+{
+    for (uint8_t i = 0; i < len; i++)
+    {
+        ltc_spi.transfer(data[i]);
     }
-    SPI.endTransaction();
 }
 
-// SPI write then read 
-// Writes tx_data (tx_len bytes) then reads back rx_len bytes into rx_data.
-
-void spi_write_read(uint8_t* tx_data, uint8_t tx_len,
-                    uint8_t* rx_data, uint8_t rx_len) {
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-    for (uint8_t i = 0; i < tx_len; i++) {
-        SPI.transfer(tx_data[i]);
+// Writes tx_len bytes then reads rx_len bytes
+// CS is managed by the caller
+void spi_write_read(uint8_t *tx_data, uint8_t tx_len,
+                    uint8_t *rx_data, uint8_t rx_len)
+{
+    for (uint8_t i = 0; i < tx_len; i++)
+    {
+        ltc_spi.transfer(tx_data[i]);
     }
-    for (uint8_t i = 0; i < rx_len; i++) {
-        rx_data[i] = SPI.transfer(0xFF);
+    for (uint8_t i = 0; i < rx_len; i++)
+    {
+        rx_data[i] = ltc_spi.transfer(0xFF);
     }
-    SPI.endTransaction();
 }
 
-// SPI read single byte 
-// Used by LTC681x_pollAdc() to check the SDO line.
-
-uint8_t spi_read_byte(uint8_t tx_data) {
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-    uint8_t rx = SPI.transfer(tx_data);
-    SPI.endTransaction();
-    return rx;
+// Single byte read — used by pollAdc()
+uint8_t spi_read_byte(uint8_t tx_dat)
+{
+    return ltc_spi.transfer(tx_dat);
 }
