@@ -7,7 +7,8 @@
 #include <LTC6811.h>
  
 static cell_asic BMS_IC[TOTAL_IC];
-static SPIClass  ads_spi(SPI);
+static SPIClass ltc_spi(HSPI);
+static SPIClass ads_spi(VSPI); 
  
  
 void printResult(const char* name, bool pass, const char* detail = "") {
@@ -19,14 +20,31 @@ void printResult(const char* name, bool pass, const char* detail = "") {
  
 static uint32_t ads_xfer(uint32_t tx) {
     uint32_t rx = 0;
+    rx |= (uint32_t)ads_spi.transfer((tx >> 24) & 0xFF) << 24;    
     rx |= (uint32_t)ads_spi.transfer((tx >> 16) & 0xFF) << 16;
     rx |= (uint32_t)ads_spi.transfer((tx >>  8) & 0xFF) << 8;
     rx |= (uint32_t)ads_spi.transfer( tx        & 0xFF);
-    ads_spi.transfer(0x00);
     return rx & 0x00FFFFFF;
 }
  
 static uint16_t ads_read_reg(uint8_t addr) {
+    uint32_t cmd = ((uint32_t)0x2000 | ((uint32_t)(addr & 0x3F) << 8)) << 16;
+
+    digitalWrite(ADS_CS_PIN, LOW);
+    ads_xfer(cmd);
+    ads_xfer(0); ads_xfer(0);
+    digitalWrite(ADS_CS_PIN, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(ADS_CS_PIN, LOW);
+    ads_xfer(0);
+    uint32_t resp = ads_xfer(0);
+    ads_xfer(0);
+    digitalWrite(ADS_CS_PIN, HIGH);
+
+    return (uint16_t)(resp >> 16);
+}
+/*static uint16_t ads_read_reg(uint8_t addr) {
     uint32_t cmd = ((uint32_t)0x20 << 16) | ((uint32_t)(addr & 0x3F) << 10);
     digitalWrite(ADS_CS_PIN, LOW);
     ads_xfer(cmd); ads_xfer(0); ads_xfer(0);
@@ -36,7 +54,7 @@ static uint16_t ads_read_reg(uint8_t addr) {
     uint32_t resp = ads_xfer(0); ads_xfer(0); ads_xfer(0);
     digitalWrite(ADS_CS_PIN, HIGH);
     return (uint16_t)((resp >> 8) & 0xFFFF);
-}
+}*/
  
 static void ads_read_channels(int32_t* ch0, int32_t* ch1) {
     digitalWrite(ADS_CS_PIN, LOW);
@@ -52,14 +70,23 @@ static void ads_read_channels(int32_t* ch0, int32_t* ch1) {
 void test_ltc6811() {
     Serial.println(F("\n[ LTC6811-1 ]"));
  
-    SPI.begin(LTC_SCLK_PIN, LTC_MISO_PIN, LTC_MOSI_PIN, LTC_CS_PIN);
+    ltc_spi.begin(LTC_SCLK_PIN, LTC_MISO_PIN, LTC_MOSI_PIN, LTC_CS_PIN);
+	LTC6811_init_reg_limits(TOTAL_IC, BMS_IC);
+	digitalWrite(LTC_CS_PIN, LOW);
+	delayMicroseconds(400);
+	digitalWrite(LTC_CS_PIN, HIGH);
+	delay(10);
+	wakeup_sleep(TOTAL_IC);
+	delay(10);
+	
+	/*SPI.begin(LTC_SCLK_PIN, LTC_MISO_PIN, LTC_MOSI_PIN, LTC_CS_PIN);
     LTC6811_init_reg_limits(TOTAL_IC, BMS_IC);
-    wakeup_sleep(TOTAL_IC);
+    wakeup_sleep(TOTAL_IC);*/
  
     // Set UV/OV thresholds from bms_thresholds.h
     for (uint8_t i = 0; i < TOTAL_IC; i++) {
         BMS_IC[i].config.tx_data[1] =  (CELL_UV_RAW & 0xFF);
-        BMS_IC[i].config.tx_data[2] = ((CELL_OV_RAW & 0x00F) << 4) |
+        BMS_IC[i].config.tx_data[2] = ((CELL_OV_RAW & 0x0F) << 4) |
                                        ((CELL_UV_RAW >> 8) & 0x0F);
         BMS_IC[i].config.tx_data[3] =  (CELL_OV_RAW >> 4) & 0xFF;
     }
@@ -75,7 +102,8 @@ void test_ltc6811() {
     wakeup_sleep(TOTAL_IC);
     LTC6811_adcv(MD_7KHZ_3KHZ, DCP_DISABLED, CELL_CH_ALL);
     LTC6811_pollAdc();
-    LTC6811_rdcv(REG_1, TOTAL_IC, BMS_IC);
+    LTC6811_rdcv(REG_ALL, TOTAL_IC, BMS_IC);
+	//LTC6811_rdcv(REG_1, TOTAL_IC, BMS_IC);
  
     bool any_uv = false, any_ov = false;
     float pack_v = 0;
@@ -101,6 +129,7 @@ void test_ltc6811() {
     bool pack_ok = (pack_v >= PACK_UV_V && pack_v <= PACK_OV_V);
     char dp[32]; snprintf(dp, sizeof(dp), "%.1fV (%.0f-%.0fV)", pack_v, PACK_UV_V, PACK_OV_V);
     printResult("Pack voltage in range (55-82V)", pack_ok, dp);
+    ltc_spi.end();
 }
  
 void test_ads131() {
@@ -112,8 +141,8 @@ void test_ads131() {
     digitalWrite(ADS_RST_PIN, LOW);  delayMicroseconds(20);
     digitalWrite(ADS_RST_PIN, HIGH); delay(5);
  
-    ads_spi.begin(ADS_SCLK_PIN, ADS_MISO_PIN, ADS_MOSI_PIN, ADS_CS_PIN);
-    ads_spi.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE1));
+    ads_spi.begin(ADS_SCLK_PIN, ADS_MISO_PIN, ADS_MOSI_PIN, -1);
+    ads_spi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
  
     // Device ID
     uint16_t id = ads_read_reg(0x00);
@@ -229,6 +258,6 @@ void loop() {
     Serial.println(F("\n Running tests"));
     test_ltc6811();
     test_ads131();
-    test_ucc37322();
+    //test_ucc37322();
     Serial.println(F("\n Tests complete"));
 }

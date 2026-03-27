@@ -111,7 +111,8 @@
 #define STAT 3
 #define CFGR 0
 #define CFGRB 4
-#define CS_PIN 10
+#include <bms_config.h>
+#define CS_PIN LTC_CS_PIN
 
 /*! Cell Voltage data structure. */
 typedef struct
