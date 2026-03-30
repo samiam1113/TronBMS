@@ -9,6 +9,8 @@
 // Cell Voltage (LTC6811 raw counts, 1 count = 100µV) 
 #define CELL_UV_RAW         27500u  // 2.75V under-voltage cutoff
 #define CELL_OV_RAW         41000u  // 4.1V  over-voltage cutoff
+#define CELL_UV_V            (CELL_UV_RAW * 0.0001f)
+#define CELL_OV_V            (CELL_OV_RAW * 0.0001f)
 
 // Pack Voltage
 #define PACK_UV_V           55.0f   // 55V pack under-voltage
@@ -21,6 +23,7 @@
 // Current - Charge
 #define CURR_CHG_PEAK_A     40.0f   // 40A  max charge
 #define CURR_CHG_CONT_A     15.0f   // 15A  continuous charge
+#define CURR_PEAK_MS         1000    // peak allowed for < 1s
 
 // Cell Balancing
 #define BAL_THRESHOLD_UV    200u    // Balance if cell delta >= 2mV (200 counts)
