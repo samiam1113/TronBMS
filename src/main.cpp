@@ -153,8 +153,6 @@ static const uint16_t FAULT_BLOCKS_CHG =
 static const uint16_t FAULT_BLOCKS_DSG =
   FAULT_CELL_UV | FAULT_PACK_UV | FAULT_OT | FAULT_OC_DSG | FAULT_SPI;
 
-SPIClass *vspi = NULL;
-SPIClass *hspi = NULL;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  LTC6811-1 — CRC-15
@@ -357,27 +355,7 @@ void ltcWaitConversion() {
   delay(10);
 }
 
-// Send WRCFGA broadcast — REFON=1, per-IC DCC bits
-// IC2 data sent first (last in chain), IC1 data sent second
-void ltcWriteCFGR(uint8_t dcc4, uint8_t dcc5) {
-  uint8_t cfgr[6] = {0xFC, 0x00, 0x00, 0x00, dcc4, dcc5};
-  uint16_t dataCrc = ltcCRC15(cfgr, 6);
- 
-  uint8_t buf[12];
-  buf[0] = 0x00; buf[1] = 0x01;
-  uint16_t cmdCrc = ltcCRC15(buf, 2);
-  buf[2] = (cmdCrc >> 8) & 0xFF;
-  buf[3] = cmdCrc & 0xFF;
-  memcpy(buf + 4, cfgr, 6);
-  buf[10] = (dataCrc >> 8) & 0xFF;
-  buf[11] = dataCrc & 0xFF;
- 
-  hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
-  digitalWrite(HSPI_SS, LOW);
-  hspi->transfer(buf, 12);
-  digitalWrite(HSPI_SS, HIGH);
-  hspi->endTransaction();
-}
+
  
 // Read one cell voltage register group from both ICs.
 // rxBuf[0..7]  = IC2 (last in chain, shifts out first)
