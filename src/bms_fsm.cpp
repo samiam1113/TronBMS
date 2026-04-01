@@ -181,10 +181,10 @@ static void state_startup(BmsFsm &fsm) {
 // ----------------------------------------------------------------------------
 static void state_normal(BmsFsm &fsm) {
     // Protection — each check calls fault_set/clear which updates fault_reg
-    meas_check_overvoltage(fsm);
-    meas_check_undervoltage(fsm);
-    meas_check_overcurrent(fsm);
-    meas_check_overtemp(fsm);
+    meas_check_overvoltage();
+    meas_check_undervoltage();
+    meas_check_overcurrent();
+    meas_check_overtemp();
     contactors_update(fsm);
  
     if (fsm.fault_reg != 0) {
@@ -218,11 +218,11 @@ static void state_normal(BmsFsm &fsm) {
 //     • Fault → FAULT
 // ----------------------------------------------------------------------------
 static void state_balance(BmsFsm &fsm) {
-    meas_check_overvoltage(fsm);
-    meas_check_undervoltage(fsm);
-    meas_check_overcurrent(fsm);
-    meas_check_overtemp(fsm);
-    meas_check_balance_overtemp(fsm);   // softer threshold, pauses balance_apply()
+    meas_check_overvoltage();
+    meas_check_undervoltage();
+    meas_check_overcurrent();
+    meas_check_overtemp();
+    meas_check_balance_overtemp();   // softer threshold, pauses balance_apply()
     contactors_update(fsm);
  
     if (fsm.fault_reg != 0) {
@@ -274,7 +274,7 @@ static void state_fault(BmsFsm &fsm) {
  
     // Sync fault_reg with bms_fault module (external callers may have cleared
     // bits via fault_clear() in bms_fault.cpp)
-    fsm.fault_reg = static_cast<uint16_t>(fault_get());
+    fsm.fault_reg = g_faultRegister;
  
     if (fsm.fault_reg == 0) {
         fsm_set_state(fsm, BmsState::INIT);
