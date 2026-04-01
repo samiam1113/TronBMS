@@ -1,0 +1,74 @@
+#pragma once
+
+//  BMS PROTECTION THRESHOLDS
+
+// Temperature
+#define TEMP_WARN_C         60      // Warn if average of all sensors >= 60°C
+#define TEMP_CUTOFF_C       70      // Hard cutoff if ANY single sensor >= 70°C
+
+// Cell Voltage (LTC6811 raw counts, 1 count = 100µV) 
+#define CELL_UV_RAW         27500u  // 2.75V under-voltage cutoff
+#define CELL_OV_RAW         41000u  // 4.1V  over-voltage cutoff
+#define CELL_UV_V            (CELL_UV_RAW * 0.0001f)
+#define CELL_OV_V            (CELL_OV_RAW * 0.0001f)
+
+// Pack Voltage
+#define PACK_UV_V           55.0f   // 55V pack under-voltage
+#define PACK_OV_V           82.0f   // 82V pack over-voltage
+
+// Current - Discharge
+#define CURR_DSCHG_PEAK_A   600.0f  // 600A max, < 1 second
+#define CURR_DSCHG_CONT_A   300.0f  // 300A continuous
+
+// Current - Charge
+#define CURR_CHG_PEAK_A     40.0f   // 40A  max charge
+#define CURR_CHG_CONT_A     15.0f   // 15A  continuous charge
+#define CURR_PEAK_MS         1000    // peak allowed for < 1s
+
+// Cell Balancing
+#define BAL_THRESHOLD_UV    200u    // Balance if cell delta >= 2mV (200 counts)
+
+// ADS131M02 Current Sensing 
+#define ADS_GAIN            4
+#define ADS_SAMPLE_US       1       // 1µs between current samples
+
+// Shunt resistor value 
+#define SHUNT_OHMS          0.0004f  
+
+// Convert ADS131 raw count to amps:
+//   Full scale = ±VREF/GAIN across shunt
+//   VREF = 1.2V (ADS131M02 internal ref), GAIN = 4
+//   Full scale input = 1.2V / 4 = 0.3V
+//   Full scale current = 0.3V / SHUNT_OHMS
+//   Count to amps = FULL_SCALE_A / 2^23
+#define ADS_VREF            1.2f
+#define ADS_FULL_SCALE_A    (ADS_VREF / (ADS_GAIN * SHUNT_OHMS))               // 0.3V     // update per shunt
+#define ADS_COUNTS_TO_AMPS  (ADS_FULL_SCALE_A / 8388608.0f)     // per count (2^23)
+#define ADS_EXPECTED_ID  0x2282    // ADS131M02-Q1 ID register value
+#define ADS_RESET_PIN 21
+
+#define ADS_GAIN1_VAL 0x0040  // CH1 gain=4 (bits[8:6]=010), CH0 gain=1
+#define ADS_CLOCK_VAL 0x030C  // OSR=4096, CH0+CH1 enabled
+
+#define TOTAL_IC 2
+#define CELLS_PER_IC 10 
+#define NUM_CELLS 20
+
+// ── Pin definitions ──────────────────────────────────────────────────────────
+#define VSPI_MISO 19
+#define VSPI_MOSI 23
+#define VSPI_SCLK 18
+#define VSPI_SS   -1    // ADS131M02-Q1: single device, CS tied to GND
+
+#define HSPI_MISO 12
+#define HSPI_MOSI 13
+#define HSPI_SCLK 14
+#define HSPI_SS   4     // LTC6811-1 chain CS
+
+// ── NTC thermistor ───────────────────────────────────────────────────────────
+#define NTC_R25    10000.0f
+#define NTC_BETA    3950.0f
+#define NTC_RBIAS  10000.0f
+
+#define GATE_DSCHG_PIN 25
+#define GATE_CHG_PIN   26
