@@ -11,6 +11,8 @@
 #include "bms_config.h"
 #include "bms_types.h"
 #include "bms_fault.h"
+#include "ltc_spi.h"
+#include "bms_balance.h"
 
 // ── LTC driver (defined in ltc_spi.cpp) ──────────────────────────────────────
 struct LtcConfig {

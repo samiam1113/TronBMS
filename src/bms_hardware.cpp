@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "bms_config.h"
+#include "bms_types.h"
+#include "bms_hardware.h"
 
 SPIClass *vspi = NULL;
 SPIClass *hspi = NULL;
