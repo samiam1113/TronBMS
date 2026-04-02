@@ -72,3 +72,15 @@
 
 #define GATE_DSCHG_PIN 25
 #define GATE_CHG_PIN   26
+
+// ── FreeRTOS event group bits ────────────────────────────────────────────────
+#define EVT_MEASURE_START       (1u << 0)
+#define EVT_FAULT_ANY           (1u << 1)
+#define EVT_FAULT_OV            (1u << 2)
+#define EVT_FAULT_UV            (1u << 3)
+#define EVT_FAULT_OC            (1u << 4)
+#define EVT_FAULT_OT            (1u << 5)
+#define EVT_FAULT_LTC           (1u << 6)
+#define EVT_FAULT_BAL_OT        (1u << 7)
+#define EVT_FAULT_TASK_STALL    (1u << 8)
+#define EVT_BALANCE_DONE        (1u << 9)

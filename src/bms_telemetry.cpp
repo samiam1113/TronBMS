@@ -85,7 +85,7 @@ void telemetry_init(void) {
     Serial.println("[telem] TWAI started (TX=GPIO16, RX=GPIO17, 500kbps)");
 }
 
-void telemetry_send(measurement_data_t *meas, bms_state_t state) {
+void telemetry_send(measurement_data_t *meas, BmsState state) {
     if (!meas) return;
 
     uint8_t buf[8];

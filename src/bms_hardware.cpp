@@ -165,23 +165,24 @@ float ads_read_current() {
     return ads_counts_to_amps(raw);
 }
 
-void ads_checkid() {
+bool ads_checkid() {
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
   uint32_t id = adsXfer24(0x20, 0x00, 0x00) >> 8;  // RREG ID
   vspi->endTransaction();
   Serial.printf("ADS131M02 ID: read 0x%04X, expected 0x%04X %s\n",
     id, ADS_EXPECTED_ID, id == ADS_EXPECTED_ID ? "(OK)" : "(MISMATCH)");
+  return id == ADS_EXPECTED_ID;
+
 }
 
-void gate_driver_selftest() {
-    digitalWrite(GATE_CHG_PIN, HIGH);
-    delay(1000);
-    digitalWrite(GATE_DSCHG_PIN, HIGH);
-    delay(1000);
+bool gate_driver_selftest() {
     digitalWrite(GATE_CHG_PIN, LOW);
-    delay(1000);
     digitalWrite(GATE_DSCHG_PIN, LOW);
-    delay(1000);
+    if(digitalRead(GATE_CHG_PIN) != LOW || digitalRead(GATE_DSCHG_PIN) != LOW) {
+        Serial.println("Gate driver self-test failed: unable to set LOW");
+        return false;
+    }
+    return true;
 
 }
 

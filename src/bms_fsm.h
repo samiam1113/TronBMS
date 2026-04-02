@@ -2,6 +2,7 @@
  
 #include <stdint.h>
 #include "bms_config.h"
+#include "bms_state.h"   // BmsState
  
 // ============================================================================
 // bms_fsm.h — BMS Finite State Machine
@@ -16,18 +17,18 @@
 //                intent is clear and a mutex can be swapped in later if needed.
 // ============================================================================
  
-// ----------------------------------------------------------------------------
-// State enum
-// ----------------------------------------------------------------------------
-enum class BmsState : uint8_t {
-    INIT    = 0,    // Power-on: wake hardware, verify comms
-    STARTUP,        // Self-test: gate driver, comms loopback
-    NORMAL,         // Idle monitoring — no active balancing
-    BALANCE,        // Active cell balancing
-    SLEEP,          // LTC + ADS in low-power sleep
-    FAULT,          // Latched fault — contactors open
+
+
+struct BmsFsm {
+    BmsState         state            = BmsState::INIT;
+    BmsState         prev_state       = BmsState::INIT;
+    uint16_t         fault_reg        = 0;
+    uint32_t         state_entry_ms   = 0;
+    uint32_t         last_activity_ms = 0;
+    bool             chg_open         = true;
+    bool             dsg_open         = true;
 };
- 
+
 // ----------------------------------------------------------------------------
 // Fault register  (bitfield — use fault_set/clear helpers, not raw OR)
 // ----------------------------------------------------------------------------
