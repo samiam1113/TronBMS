@@ -20,7 +20,7 @@
 //     exit  : → BALANCE | → SLEEP | → FAULT
 //
 //   BALANCE
-//     entry : ltc_start_adc_conversion()
+//     entry : notify task_balance (ADCV now issued inside ltc_read_voltages)
 //     do    : recompute + apply balance mask each tick, protection checks
 //     exit  : → NORMAL (balanced) | → FAULT
 //
@@ -37,13 +37,24 @@
 // ============================================================================
 
 #include "bms_fsm.h"
-#include "ltc_spi.cpp"
-#include "bms_hardware.cpp"
-#include "bms_measurements.cpp"
-#include "bms_balance.cpp"
-#include "bms_fault.cpp"
-
+#include "ltc_spi.h"
+#include "bms_hardware.h"
+#include "bms_measurements.h"
+#include "bms_balance.h"
+#include "bms_fault.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <Arduino.h>
+
+// Forward declarations — defined in bms_tasks.cpp
+extern SemaphoreHandle_t g_meas_mutex;
+extern SemaphoreHandle_t g_snapshot_mutex;   // Fix #4
+extern measurement_data_t g_meas;
+
+// ── Fault snapshot globals — defined in bms_tasks.cpp ────────────────────────
+extern fault_snapshot_t  g_fault_snapshot;
+extern volatile bool     g_fault_snapshot_pending;
+extern TaskHandle_t      g_balance_task_handle;
 
 // Forward declaration — defined below fsm_on_enter
 static void fsm_on_enter(BmsFsm &fsm, BmsState new_state);
@@ -85,10 +96,10 @@ static void contactors_update(BmsFsm &fsm) {
 // FSM-local fault_set — sets bit in fsm.fault_reg and re-evaluates contactors.
 // Distinct from the global fault_set() in bms_fault.cpp which sets g_faultRegister.
 static void fsm_fault_set(BmsFsm &fsm, Fault bit) {
-    fsm.fault_reg |= bit;
+    fault_set(static_cast<uint16_t>(bit));  // write to g_faultRegister first
+    fsm.fault_reg = fault_get();            // then mirror into fsm
     contactors_update(fsm);
 }
-
 static bool state_timeout(const BmsFsm &fsm, uint32_t ms) {
     return (millis() - fsm.state_entry_ms) >= ms;
 }
@@ -104,7 +115,7 @@ static void state_init(BmsFsm &fsm) {
     ltc_wakeup_sleep();
 
     ads_reset();
-    if (!configureADS131M02()) {
+    if (!ads_configure()) {
         fsm_fault_set(fsm, Fault::ADS_ID);
         fsm_set_state(fsm, BmsState::FAULT);
         return;
@@ -161,13 +172,6 @@ static void state_normal(BmsFsm &fsm) {
     //  runs at lower priority than task_measure — acceptable for protection)
     const measurement_data_t &meas = g_meas;
 
-    if (meas_check_overvoltage(&meas))  fsm_fault_set(fsm, Fault::CELL_OV);
-    if (meas_check_undervoltage(&meas)) fsm_fault_set(fsm, Fault::CELL_UV);
-    if (meas_check_overcurrent(&meas))  fsm_fault_set(fsm, Fault::OC_DSG);
-
-    uint8_t ot_ch = 0;
-    if (meas_check_overtemp(&meas, &ot_ch)) fsm_fault_set(fsm, Fault::OT);
-
     contactors_update(fsm);
 
     if (fsm.fault_reg != 0) {
@@ -175,8 +179,7 @@ static void state_normal(BmsFsm &fsm) {
         return;
     }
 
-    if (state_timeout(fsm, SLEEP_IDLE_TIMEOUT_MS) &&
-        (millis() - fsm.last_activity_ms) >= SLEEP_IDLE_TIMEOUT_MS) {
+    if ((millis() - fsm.last_activity_ms) >= SLEEP_IDLE_TIMEOUT_MS) {
         fsm_set_state(fsm, BmsState::SLEEP);
         return;
     }
@@ -190,44 +193,40 @@ static void state_normal(BmsFsm &fsm) {
 // BALANCE — active cell balancing, protection checks every tick
 // ----------------------------------------------------------------------------
 static void state_balance(BmsFsm &fsm) {
-    const measurement_data_t &meas = g_meas;
+    // FSM only monitors for fault/completion conditions each tick.
+    // All DCC mask computation and hardware writes are owned by task_balance.
 
-    if (meas_check_overvoltage(&meas))  fsm_fault_set(fsm, Fault::CELL_OV);
-    if (meas_check_undervoltage(&meas)) fsm_fault_set(fsm, Fault::CELL_UV);
-    if (meas_check_overcurrent(&meas))  fsm_fault_set(fsm, Fault::OC_DSG);
+    measurement_data_t meas_snap;
+    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        meas_snap = g_meas;
+        xSemaphoreGive(g_meas_mutex);
+    } else {
+        return;
+    }
 
-    uint8_t ot_ch = 0;
-    if (meas_check_overtemp(&meas, &ot_ch)) fsm_fault_set(fsm, Fault::OT);
-
+    // Check balance overtemp — sets g_balance_overtemp which task_balance reads
     uint8_t bal_ot_ch = 0;
-    meas_check_balance_overtemp(&meas, &bal_ot_ch);  // sets g_balance_overtemp
+    meas_check_balance_overtemp(&meas_snap, &bal_ot_ch);
 
     contactors_update(fsm);
 
     if (fsm.fault_reg != 0) {
-        balance_stop(&g_meas);
+        // Signal task_balance to stop by setting state before it checks
         fsm_set_state(fsm, BmsState::FAULT);
         return;
     }
-
-    // balance_compute_mask writes into g_meas.balance_cells
-    balance_compute_mask(&g_meas);
-    // balance_apply reads g_meas.balance_cells and pushes to LTC;
-    // skips the write if g_balance_overtemp is set
-    balance_apply(&g_meas);
-
-    if (balance_satisfied(&meas)) {
-        balance_stop(&g_meas);
-        fsm_set_state(fsm, BmsState::NORMAL);
-    }
+    // Completion (EVT_BALANCE_DONE) and fault exit are handled by
+    // task_fsm's event group processing — no action needed here
 }
 
 // ----------------------------------------------------------------------------
 // SLEEP — LTC asleep, poll ADS131 current for wakeup
 // ----------------------------------------------------------------------------
 static void state_sleep(BmsFsm &fsm) {
-    const float amps = ads_read_current();
+    // Wait for LTC reference to settle before polling current
+    if ((millis() - fsm.state_entry_ms) < 3000) return;
 
+    const float amps = ads_read_current();
     if (amps > 1.0f || amps < -1.0f) {
         fsm.last_activity_ms = millis();
         fsm_set_state(fsm, BmsState::INIT);
@@ -240,10 +239,7 @@ static void state_sleep(BmsFsm &fsm) {
 static void state_fault(BmsFsm &fsm) {
     contactor_open_chg(fsm);
     contactor_open_dsg(fsm);
-
-    // Sync with bms_fault module — external callers clear bits via fault_clear()
-    fsm.fault_reg = g_faultRegister;
-
+    fsm.fault_reg = fault_get();
     if (fsm.fault_reg == 0) {
         fsm_set_state(fsm, BmsState::INIT);
     }
@@ -257,8 +253,6 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
     fsm.state          = new_state;
     fsm.state_entry_ms = millis();
 
-    fault_snapshot_t     g_fault_snapshot         = {};
-
     switch (new_state) {
 
         case BmsState::INIT:
@@ -269,17 +263,21 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
             break;
 
         case BmsState::NORMAL:
+            fsm.last_activity_ms = millis();  // reset idle timer on every NORMAL entry
             contactors_update(fsm);
             break;
 
         case BmsState::BALANCE:
-            ltc_start_adc_conversion(true, false);
+            // ADCV is now issued inside ltc_read_voltages — no need to start
+            // a conversion here. Just notify task_balance to begin.
+            if (g_balance_task_handle) {
+                xTaskNotifyGive(g_balance_task_handle);
+            }
             break;
 
         case BmsState::SLEEP:
             balance_stop(&g_meas);
             ltc_wakeup_sleep();
-            delay(3000);
             contactor_open_chg(fsm);
             contactor_open_dsg(fsm);
             break;
@@ -287,9 +285,21 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
         case BmsState::FAULT:
             contactor_open_chg(fsm);
             contactor_open_dsg(fsm);
-            balance_stop(&g_meas);
-            fault_capture_context(&g_fault_snapshot, fsm.prev_state);
-            fault_log_write(&g_fault_snapshot);
+            balance_stop(nullptr);  // clears DCC hardware only, no struct write
+            // Fix #4: hold g_snapshot_mutex across the full struct write AND the
+            // flag set. task_daq checks the flag under the same mutex, so it can
+            // never observe pending=true while the struct is only partially written.
+            if (xSemaphoreTake(g_snapshot_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                fault_capture_context(&g_fault_snapshot, fsm.prev_state);
+                fault_log_write(&g_fault_snapshot);
+                g_fault_snapshot_pending = true;
+                xSemaphoreGive(g_snapshot_mutex);
+            } else {
+                // Mutex timeout at fault entry — still capture and log,
+                // skip the pending flag so DAQ doesn't race the partial write.
+                fault_capture_context(&g_fault_snapshot, fsm.prev_state);
+                fault_log_write(&g_fault_snapshot);
+            }
             break;
     }
 }

@@ -23,6 +23,7 @@ extern float ads_read_current();
 
 // ── Module-level peak current timer ──────────────────────────────────────────
 static uint32_t s_oc_peak_start_ms = 0;
+static bool     s_oc_peak_is_charge = false;
 
 // ── Global balance overtemp flag — read by bms_balance.cpp ───────────────────
 bool g_balance_overtemp = false;
@@ -131,14 +132,21 @@ bool meas_check_overcurrent(const measurement_data_t *meas) {
         if (a >= CURR_DSCHG_CONT_A) {
             Serial.printf("[meas] OC_DSG cont: %.1f A (limit %.0f A)\n",
                           a, CURR_DSCHG_CONT_A);
+            s_oc_peak_start_ms = 0;   // reset so peak timer is clean on next entry
             return true;
         }
         if (a >= CURR_DSCHG_PEAK_A) {
+            // Reset timer if we just crossed from charge direction
+            if (s_oc_peak_is_charge) {
+                s_oc_peak_start_ms  = 0;
+                s_oc_peak_is_charge = false;
+            }
             if (s_oc_peak_start_ms == 0) {
                 s_oc_peak_start_ms = millis();
             } else if ((millis() - s_oc_peak_start_ms) > (uint32_t)CURR_PEAK_MS) {
                 Serial.printf("[meas] OC_DSG peak: %.1f A held > %d ms\n",
                               a, CURR_PEAK_MS);
+                s_oc_peak_start_ms = 0;
                 return true;
             }
         } else {
@@ -152,14 +160,21 @@ bool meas_check_overcurrent(const measurement_data_t *meas) {
         if (abs_a >= CURR_CHG_CONT_A) {
             Serial.printf("[meas] OC_CHG cont: %.1f A (limit %.0f A)\n",
                           abs_a, CURR_CHG_CONT_A);
+            s_oc_peak_start_ms = 0;
             return true;
         }
         if (abs_a >= CURR_CHG_PEAK_A) {
+            // Reset timer if we just crossed from discharge direction
+            if (!s_oc_peak_is_charge) {
+                s_oc_peak_start_ms  = 0;
+                s_oc_peak_is_charge = true;
+            }
             if (s_oc_peak_start_ms == 0) {
                 s_oc_peak_start_ms = millis();
             } else if ((millis() - s_oc_peak_start_ms) > (uint32_t)CURR_PEAK_MS) {
                 Serial.printf("[meas] OC_CHG peak: %.1f A held > %d ms\n",
                               abs_a, CURR_PEAK_MS);
+                s_oc_peak_start_ms = 0;
                 return true;
             }
         } else {
@@ -179,7 +194,7 @@ bool meas_check_overtemp(const measurement_data_t *meas, uint8_t *ot_ch_out) {
     float sum     = 0.0f;
     int   valid_n = 0;
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
         const float t = meas->temps[i];
         if (t < -50.0f) continue;
 
@@ -207,7 +222,7 @@ bool meas_check_balance_overtemp(const measurement_data_t *meas, uint8_t *ot_ch_
 
     if (ot_ch_out) *ot_ch_out = 0xFF;
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
         const float t = meas->temps[i];
         if (t < -50.0f) continue;
         if (t >= (float)TEMP_WARN_C) {
@@ -219,7 +234,7 @@ bool meas_check_balance_overtemp(const measurement_data_t *meas, uint8_t *ot_ch_
     }
 
     bool all_cool = true;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
         const float t = meas->temps[i];
         if (t < -50.0f) continue;
         if (t >= ((float)TEMP_WARN_C - BAL_OT_CLEAR_HYST_C)) {

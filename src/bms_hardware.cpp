@@ -52,7 +52,7 @@ void ads_reset(){
     vspi->endTransaction();
 }
 
-bool configureADS131M02() {
+bool ads_configure() {
   digitalWrite(ADS_RESET_PIN, LOW);
   delay(2);
   digitalWrite(ADS_RESET_PIN, HIGH);
@@ -138,54 +138,75 @@ bool configureADS131M02() {
 //  ADS131M02-Q1 — CH1 current read
 // ════════════════════════════════════════════════════════════════════════════
 
-// Returns signed 16-bit raw count — convert with adsCounts_to_amps()
-int16_t ads_read_raw() {
+// Returns signed 24-bit two's complement raw count from CH1.
+// The ADS131M02 runs continuous conversions — each NULL frame clocks out
+// the most recent completed sample. No WAKEUP needed here; that belongs
+// only in ads_configure() / startup.
+int32_t ads_read_raw() {
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
- 
-  adsXfer24(0x00, 0x33, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
- 
-  adsXfer24(0x00, 0x00, 0x00);                    // w1: STATUS
-  adsXfer24(0x00, 0x00, 0x00);                    // w2: CH0 discard
-  uint32_t ch1raw = adsXfer24(0x00, 0x00, 0x00);  // w3: CH1
-  adsXfer24(0x00, 0x00, 0x00);                    // w4: CRC
- 
+
+  // NULL command — device responds with STATUS + CH0 + CH1 + CRC
+  // containing the latest continuous conversion result.
+  adsXfer24(0x00, 0x00, 0x00);                     // w1: STATUS  (discard)
+  adsXfer24(0x00, 0x00, 0x00);                     // w2: CH0     (discard — voltage sense)
+  uint32_t ch1raw = adsXfer24(0x00, 0x00, 0x00);  // w3: CH1     — current shunt
+  adsXfer24(0x00, 0x00, 0x00);                     // w4: CRC     (discard)
+
   vspi->endTransaction();
- 
-  int32_t val = (int32_t)(ch1raw << 8) >> 8;  // sign extend 24→32
-  return (int16_t)(val >> 8);                  // top 16 bits
+
+  // Sign-extend 24-bit two's complement to int32_t
+  return (int32_t)((ch1raw & 0x00FFFFFFu) << 8) >> 8;
 }
  
-float ads_counts_to_amps(int16_t raw) {
-  return raw * ADS_FULL_SCALE_A;
+float ads_counts_to_amps(int32_t raw) {
+  return (float)raw * ADS_COUNTS_TO_AMPS;
 }
 
 float ads_read_current() {
-    int16_t raw = ads_read_raw();
+    int32_t raw = ads_read_raw();
     return ads_counts_to_amps(raw);
 }
 
 bool ads_checkid() {
+  // ADS131M02 RREG protocol:
+  //   Frame N:   send RREG command (w1) + 3 NULL words
+  //   Frame N+1: send NULL (w1) — device responds with register value in w1
+  // The register value is NOT in the same frame as the command.
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
-  uint32_t id = adsXfer24(0x20, 0x00, 0x00) >> 8;  // RREG ID
+
+  // Frame 1: RREG ID register (address 0x00, 1 register)
+  // Command word: 0b 0010 0000 0000 0000 = 0x2000
+  adsXfer24(0x20, 0x00, 0x00);   // w1: RREG command
+  adsXfer24(0x00, 0x00, 0x00);   // w2: don't care
+  adsXfer24(0x00, 0x00, 0x00);   // w3: don't care
+  adsXfer24(0x00, 0x00, 0x00);   // w4: CRC don't care
+
+  // Frame 2: NULL — response word 1 contains the ID register value
+  uint32_t id_raw = adsXfer24(0x00, 0x00, 0x00);  // w1: ID register (MSB-aligned in 24 bits)
+  adsXfer24(0x00, 0x00, 0x00);   // w2: don't care
+  adsXfer24(0x00, 0x00, 0x00);   // w3: don't care
+  adsXfer24(0x00, 0x00, 0x00);   // w4: CRC don't care
+
   vspi->endTransaction();
+
+  uint16_t id = (uint16_t)(id_raw >> 8);  // shift MSB-aligned 24-bit → 16-bit value
   Serial.printf("ADS131M02 ID: read 0x%04X, expected 0x%04X %s\n",
     id, ADS_EXPECTED_ID, id == ADS_EXPECTED_ID ? "(OK)" : "(MISMATCH)");
   return id == ADS_EXPECTED_ID;
-
 }
 
 bool gate_driver_selftest() {
-    digitalWrite(GATE_CHG_PIN, LOW);
+    // No feedback pin on this board revision — digitalRead on an output pin
+    // only reads the output latch, not the actual gate driver state, so it
+    // cannot detect a shorted or open-drain fault.
+    //
+    // TODO: wire a feedback / fault line from the gate driver IC and read it
+    // here. Until then we verify only that the GPIO is configured as output
+    // and can be driven low (safe state before contactors are enabled).
+    digitalWrite(GATE_CHG_PIN,   LOW);
     digitalWrite(GATE_DSCHG_PIN, LOW);
-    if(digitalRead(GATE_CHG_PIN) != LOW || digitalRead(GATE_DSCHG_PIN) != LOW) {
-        Serial.println("Gate driver self-test failed: unable to set LOW");
-        return false;
-    }
+    Serial.println("[gate] Self-test: outputs set LOW (no feedback pin — extend when available)");
     return true;
-
 }
 
 void gate_driver_enable() {
@@ -209,8 +230,22 @@ void contactorInit() {
 void bms_gpio_init() {
   pinMode(GATE_DSCHG_PIN, OUTPUT);
   pinMode(GATE_CHG_PIN,   OUTPUT);
-  pinMode(ADS_RESET_PIN, OUTPUT);
-  pinMode(HSPI_SS, OUTPUT);
+  pinMode(ADS_RESET_PIN,  OUTPUT);
+  pinMode(HSPI_SS,        OUTPUT);
+
+  // Fix #5: ESP32 pinMode(OUTPUT) leaves the pin LOW, which holds the
+  // ADS131M02 in hardware reset (/RESET is active-low). Drive it HIGH
+  // here so the device is out of reset before any SPI traffic occurs.
+  // ads_configure() will toggle it again during its own init sequence,
+  // but this ensures no accidental reset if init order ever changes.
+  digitalWrite(ADS_RESET_PIN, HIGH);
+
+  // Contactors default to open (safe state)
+  digitalWrite(GATE_DSCHG_PIN, LOW);
+  digitalWrite(GATE_CHG_PIN,   LOW);
+
+  // LTC CS defaults to deasserted (HIGH)
+  digitalWrite(HSPI_SS, HIGH);
 }
 
 void bms_spi_init() {
@@ -220,6 +255,3 @@ void bms_spi_init() {
   vspi->begin(VSPI_SCLK, VSPI_MISO, VSPI_MOSI);
   hspi->begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, HSPI_SS);
 }
-
-
-

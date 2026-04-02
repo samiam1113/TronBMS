@@ -14,29 +14,34 @@
 #include "ltc_spi.h"
 #include "bms_balance.h"
 
-// ── LTC driver (defined in ltc_spi.cpp) ──────────────────────────────────────
-struct LtcConfig {
-    bool     gpio_pulldown[5];
-    bool     refon;
-    bool     adcopt;
-    uint16_t vuv;
-    uint16_t vov;
-    uint16_t dcc;
-    uint8_t  dcto;
-};
-
-extern ltc_status_t ltc_write_config(const LtcConfig cfg[2]);
-
 // ── Balance overtemp flag (set by meas_check_balance_overtemp) ───────────────
 extern bool g_balance_overtemp;
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
-static void build_safe_config(LtcConfig cfg[2], uint16_t dcc0, uint16_t dcc1) {
+//
+// Fix #8: build_safe_config previously hardcoded gpio_pulldown[g] = false for
+// all 5 GPIOs. On IC1, GPIO1–5 are the thermistor mux lines — if any of those
+// pull-downs are needed by ltc_read_temperatures, every balance_apply() and
+// balance_stop() call was silently clobbering the temperature measurement config.
+//
+// The fix passes a caller-supplied gpio_pulldown array. Callers that have a
+// live config (from ltc_read_config) pass those bits through unchanged.
+// balance_stop() has no live config to hand, so it passes all-false, which is
+// safe — it only writes DCC=0 to stop balancing; temperature reads are not
+// active while balance_stop() is called (FSM is leaving BALANCE or entering
+// FAULT/SLEEP, where the LTC is about to be put to sleep anyway).
+//
+// If your schematic uses the LTC internal pull-downs for any NTC divider,
+// replace the balance_stop() call below with the actual pull-down config.
+static void build_safe_config(LtcConfig cfg[2],
+                               uint16_t dcc0, uint16_t dcc1,
+                               const bool gpio_pd[5])
+{
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         cfg[ic].refon  = true;
         cfg[ic].adcopt = false;
         cfg[ic].dcto   = 0x00;
-        for (int g = 0; g < 5; g++) cfg[ic].gpio_pulldown[g] = false;
+        for (int g = 0; g < 5; g++) cfg[ic].gpio_pulldown[g] = gpio_pd[g];
         cfg[ic].vuv = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
         cfg[ic].vov = (uint16_t) (CELL_OV_RAW / 16u);
     }
@@ -115,9 +120,25 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
         Serial.printf("[bal] IC%d DCC mask: 0x%03X\n", ic + 1, dcc[ic]);
     }
 
+    // Fix #8: read the current LTC config so we can preserve the GPIO
+    // pull-down bits that ltc_read_temperatures relies on. Writing
+    // gpio_pulldown=false unconditionally clobbered the thermistor mux
+    // configuration on every balance write.
+    LtcConfig live[TOTAL_IC];
+    bool gpio_pd[5] = {false, false, false, false, false};
+    if (ltc_read_config(live)) {
+        // Use IC1's GPIO state as the authoritative source — IC1 owns the
+        // thermistor GPIOs. If read fails we fall back to all-false, which
+        // is safer than using stale data.
+        for (int g = 0; g < 5; g++) gpio_pd[g] = live[0].gpio_pulldown[g];
+    } else {
+        Serial.println("[bal] balance_apply: ltc_read_config failed — GPIO pull-downs set to false");
+    }
+
     LtcConfig cfg[TOTAL_IC];
-    build_safe_config(cfg, dcc[0], dcc[1]);
-    return ltc_write_config(cfg);
+    build_safe_config(cfg, dcc[0], dcc[1], gpio_pd);
+    ltc_write_config(cfg);
+    return LTC_OK;
 }
 
 // ============================================================================
@@ -131,8 +152,14 @@ void balance_stop(measurement_data_t *meas) {
                 meas->balance_cells[ic][c] = false;
     }
 
+    // Fix #8: balance_stop is called when leaving BALANCE, entering FAULT,
+    // or entering SLEEP. In all three cases the LTC is either going to sleep
+    // or the FSM is faulted — temperature reads are not active, so passing
+    // all-false for GPIO pull-downs here is safe. If your schematic uses the
+    // LTC internal pull-downs for NTC dividers, substitute the real config.
+    static const bool gpio_pd_off[5] = {false, false, false, false, false};
     LtcConfig cfg[TOTAL_IC];
-    build_safe_config(cfg, 0x0000, 0x0000);
+    build_safe_config(cfg, 0x0000, 0x0000, gpio_pd_off);
     ltc_write_config(cfg);
 
     Serial.println("[bal] balance_stop() — all DCC bits cleared");

@@ -90,8 +90,10 @@ void telemetry_send(measurement_data_t *meas, BmsState state) {
 
     uint8_t buf[8];
 
-    // ── Cell voltages: 2 cells per frame, 10 frames total ────────────────────
-    // Frame 0x100: IC1 cells 0,1 — frame 0x109: IC2 cells 8,9
+    // ── Cell voltages: 2 cells per frame, 10 frames per IC ───────────────────
+    // Frame 0x100: IC1 cells 0,1
+    // Frame 0x104: IC2 cells 0,1
+    // Frame 0x109: IC2 cells 8,9
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         for (int pair = 0; pair < CELLS_PER_IC / 2; pair++) {
             uint32_t frame_id = CAN_ID_CELLS + (ic * (CELLS_PER_IC / 2)) + pair;
@@ -101,12 +103,19 @@ void telemetry_send(measurement_data_t *meas, BmsState state) {
         }
     }
 
-    // ── Temperatures: 2 channels per frame, 2 frames ─────────────────────────
-    // Frame 0x110: temps[0,1] — frame 0x111: temps[2,3]
-    for (int pair = 0; pair < 2; pair++) {
+    // ── Temperatures: 2 channels per frame ───────────────────────────────────
+    // Frame 0x110: temps[0,1]
+    // Frame 0x111: temps[2,3]
+    // Frame 0x112: temps[4] + 0.0f padding
+    for (int pair = 0; pair < NUM_TEMP_SENSORS / 2; pair++) {
         pack_float(buf, 0, meas->temps[pair * 2]);
         pack_float(buf, 4, meas->temps[pair * 2 + 1]);
         twai_transmit_frame(CAN_ID_TEMPS + pair, buf, 8);
+    }
+    if (NUM_TEMP_SENSORS % 2 != 0) {
+        pack_float(buf, 0, meas->temps[NUM_TEMP_SENSORS - 1]);
+        pack_float(buf, 4, 0.0f);
+        twai_transmit_frame(CAN_ID_TEMPS + (NUM_TEMP_SENSORS / 2), buf, 8);
     }
 
     // ── Current + state: frame 0x120 ─────────────────────────────────────────

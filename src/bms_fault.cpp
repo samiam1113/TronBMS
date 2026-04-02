@@ -11,6 +11,8 @@
 #include "bms_types.h"
 #include "bms_fault.h"
 #include "bms_fsm.h"
+#include "freertos/semphr.h"
+#include "bms_tasks.h"   // for g_meas_mutex
 
 // ── Single global measurement struct — replaces all scattered globals ─────────
 // Written by task_measure under g_meas_mutex.
@@ -25,17 +27,18 @@ static const char *NVS_NAMESPACE = "bms_fault";
 static const char *NVS_KEY_SNAP  = "last_snap";
 
 // ── Fault register API ────────────────────────────────────────────────────────
+static portMUX_TYPE s_fault_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void fault_set(uint16_t bit) {
-    portENTER_CRITICAL_SAFE(nullptr);
+    portENTER_CRITICAL_SAFE(&s_fault_mux);
     g_faultRegister |= bit;
-    portEXIT_CRITICAL_SAFE(nullptr);
+    portEXIT_CRITICAL_SAFE(&s_fault_mux);
 }
 
 void fault_clear(uint16_t bit) {
-    portENTER_CRITICAL_SAFE(nullptr);
+    portENTER_CRITICAL_SAFE(&s_fault_mux);
     g_faultRegister &= (uint16_t)(~bit);
-    portEXIT_CRITICAL_SAFE(nullptr);
+    portEXIT_CRITICAL_SAFE(&s_fault_mux);
 }
 
 uint16_t fault_get(void) {
@@ -62,8 +65,15 @@ void fault_capture_context(fault_snapshot_t *snap, BmsState state_at_fault) {
     else if (fr & Fault::GATE)    snap->code = FaultCode::STARTUP;
     else                          snap->code = FaultCode::NONE;
 
-    // Copy current pack state into snapshot — g_meas is the single source
-    snap->meas = g_meas;
+    // D4 fix: protect g_meas copy with mutex
+    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        snap->meas = g_meas;
+        xSemaphoreGive(g_meas_mutex);
+    } else {
+        // Mutex timeout — copy anyway, snapshot may be slightly torn
+        // but a fault log is better than no log
+        snap->meas = g_meas;
+    }
 
     Serial.printf("[fault] Context captured: code=%d state=%d fault_reg=0x%04X\n",
                   static_cast<uint8_t>(snap->code),
