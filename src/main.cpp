@@ -172,6 +172,9 @@ static void task_test(void *pvParameters) {
     if (!ltc_comms_ok) {
         Serial.println("  [SKIP] LTC comms failed — skipping.");
     } else {
+        ltc_wakeup_sleep();          // re-wake IC1 after scope loop ended
+        vTaskDelay(pdMS_TO_TICKS(50));  // give IC1 time to fully wake
+
         LtcConfig cfg_write[TOTAL_IC] = {};
         for (int ic = 0; ic < TOTAL_IC; ic++) {
             cfg_write[ic].refon   = true;
@@ -186,7 +189,7 @@ static void task_test(void *pvParameters) {
         Serial.printf("  Writing: REFON=1, DCC=0, VUV=0x%03X, VOV=0x%03X\n",
                       cfg_write[0].vuv, cfg_write[0].vov);
         ltc_write_config(cfg_write);
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(50));  // was 2ms
 
         LtcConfig cfg_read[TOTAL_IC] = {};
         bool readback_ok = ltc_read_config(cfg_read);
