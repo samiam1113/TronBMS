@@ -75,6 +75,7 @@ bool ltc_read_status(LtcStatus status[2]);
 // Communications self-test
 // ----------------------------------------------------------------------------
 bool ltc_comms_test(void);
+void ltc_scope_loop(void);   
 
 // ----------------------------------------------------------------------------
 // Balance cell control (low-level — prefer balance_apply() in bms_balance)
