@@ -1,478 +1,556 @@
-// ============================================================================
-// main.cpp — TronBMS hardware validation build
-//
-// PURPOSE: One-shot sequential test of all subsystems except balancing.
-//          Runs from a single FreeRTOS task (task_test) so the FSM and its
-//          fault machinery are fully active — faults trip contactors and log
-//          to NVS exactly as they would in production.
-//
-// TEST SEQUENCE:
-//   1. LTC6811 comms loopback (WRCOMM/RDCOMM)
-//   2. LTC6811 config write/readback (REFON=1, DCC=0)
-//   3. Cell voltage read — prints all 20 cells, flags any OV/UV/ZERO
-//   4. Temperature read — prints all 5 sensors, flags any OT/open
-//   5. ADS131M02 configure + ID verify
-//   6. ADS131M02 current read + overcurrent check
-//   7. Gate driver selftest
-//
-// DEBUG FEATURES:
-//   - Press any Serial key to start the test sequence
-//   - Press any Serial key between tests to advance to the next step
-//   - On test failure: prints fault details, waits for keypress to continue
-//     (does NOT auto-abort — remaining tests still run so you can see full
-//      board state. LTC comms failure is the only hard stop since all
-//      subsequent LTC tests would be meaningless.)
-//   - Fault register and FSM state printed after every failure, not just at end
-//   - NVS fault from previous run is cleared before the new run starts
-//
-// OMITTED (not under test):
-//   - task_balance / balance_compute_mask / balance_apply
-//   - task_daq / CAN telemetry
-//   - Sleep state
-// ============================================================================
-
 #include <Arduino.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "nvs_flash.h"
+#include <SPI.h>
 #include "esp_task_wdt.h"
 #include "bms_config.h"
-#include "bms_types.h"
-#include "bms_fsm.h"
-#include "bms_fault.h"
-#include "bms_hardware.h"
-#include "bms_measurements.h"
-#include "bms_tasks.h"
 #include "ltc_spi.h"
 
-// ── Global FSM context — extern'd by bms_tasks.cpp and bms_fsm.cpp ───────────
-BmsFsm g_fsm;
+// ── LTC6811-1 commands ───────────────────────────────────────────────────────
+#define LTC_WRCFGA 0x0001
+#define LTC_RDCFGA 0x0002
+#define LTC_ADCV   0x0360  // Start all-cell ADC, 7kHz mode
+#define LTC_RDCVA  0x0004
+#define LTC_RDCVB  0x0006
+#define LTC_RDCVC  0x0008
+#define LTC_RDCVD  0x000A
+#define LTC_ADAX   0x0560  // Start all GPIO + 2nd ref ADC, 7kHz mode
+#define LTC_RDAUXA 0x000C
+#define LTC_RDAUXB 0x000E
+#define LTC_RDSTATA 0x0010 // Status group A: SC, ITMP, VA
+#define LTC_RDSTATB 0x0012 // Status group B: VD, flags
+#define LTC_ADSTAT  0x0468 // Start status group ADC
+#define LTC_WRCOMM  0x0721
+#define LTC_RDCOMM  0x0722
+#define LTC_PLADC   0x0714 // Poll ADC — SDO=0xFF when conversion done
 
-// ── Test result tracking ──────────────────────────────────────────────────────
-static int s_tests_run    = 0;
-static int s_tests_passed = 0;
+static const int LTC_SPI_CLK = 1000000;  // LTC6811-1 max 1 MHz
+//static const int NUM_CELLS = 20;  
 
-// ============================================================================
-// Serial blocking helpers
-// ============================================================================
+extern SPIClass *hspi;  // defined in bms_hardware.cpp
 
-// Block until the user presses any key in Serial Monitor.
-// Feeds the hardware WDT while waiting so the ESP32 doesn't reset.
-static void wait_for_keypress(const char *prompt = nullptr) {
-    if (prompt) Serial.printf("\n  >> %s\n", prompt);
-    else        Serial.println("\n  >> Press any key to continue...");
+static uint16_t pec15Table[256];
+static bool pec15TableInit = false;
+
+// Forward declaration — parseGroup is defined later in this file
+static void parseGroup(uint8_t *raw, float *outV, uint16_t *outRaw);
+
+// (Cell storage moved to measurement_data_t in bms_fault.h)
+
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  LTC6811-1 — CRC-15
+// ════════════════════════════════════════════════════════════════════════════
+
+static void initPEC15Table() {
+  uint16_t remainder;
+  for (int i = 0; i < 256; i++) {
+    remainder = i << 7;
+    for (int bit = 8; bit > 0; bit--) {
+      if (remainder & 0x4000)
+        remainder = ((remainder << 1)) ^ 0x4599;
+      else
+        remainder = (remainder << 1);
+    }
+    pec15Table[i] = remainder & 0xFFFF;
+  }
+}
+
+uint16_t ltc_pec15_calc(uint8_t *data, uint8_t len) {
+  if (!pec15TableInit) { initPEC15Table(); pec15TableInit = true; }
+  uint16_t remainder = 16; // PEC seed
+  for (uint8_t i = 0; i < len; i++) {
+    uint16_t address = ((remainder >> 7) ^ data[i]) & 0xFF;
+    remainder = (remainder << 8) ^ pec15Table[address];
+  }
+  return (remainder * 2) & 0xFFFF;
+}
+
+bool ltc_pec15_verify(uint8_t *data, uint8_t len, uint16_t received_pec) {
+    return ltc_pec15_calc(data, len) == received_pec;
+}
+
+static void buildCmd(uint16_t cmd, uint8_t out[4]) {
+    out[0] = (cmd >> 8) & 0xFF;
+    out[1] =  cmd       & 0xFF;
+    uint16_t crc = ltc_pec15_calc(out, 2);
+    out[2] = (crc >> 8) & 0xFF;
+    out[3] =  crc       & 0xFF;
+}
+
+// Broadcast a 4-byte command to all ICs — no data phase
+static void sendCmd(uint16_t cmd) {
+    uint8_t buf[4];
+    buildCmd(cmd, buf);
+    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+    digitalWrite(HSPI_SS, LOW);
+    hspi->transfer(buf, 4);
+    digitalWrite(HSPI_SS, HIGH);
+    hspi->endTransaction();
+}
+
+// Read one register group from both ICs — returns ic0=IC1 data, ic1=IC2 data
+static bool readGroup(uint16_t cmd, uint8_t ic0[6], uint8_t ic1[6]) {
+    uint8_t cmdBuf[4];
+    buildCmd(cmd, cmdBuf);
+    uint8_t rxBuf[16] = {0};
+
+    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+    digitalWrite(HSPI_SS, LOW);
+    hspi->transfer(cmdBuf, 4);
+    hspi->transfer(rxBuf, 16);
+    digitalWrite(HSPI_SS, HIGH);
+    hspi->endTransaction();
+
+    // Daisy-chain RX order: closest IC shifts out first.
+    // IC2 is closest to ESP32, IC1 is furthest (through HM2101).
+    // Therefore: first 8 bytes received = IC2, last 8 bytes = IC1.
+    uint8_t *ic2rx = rxBuf;
+    uint8_t *ic1rx = rxBuf + 8;
+
+    uint16_t crc2recv = ((uint16_t)ic2rx[6] << 8) | ic2rx[7];
+    uint16_t crc1recv = ((uint16_t)ic1rx[6] << 8) | ic1rx[7];
+
+    if (!ltc_pec15_verify(ic2rx, 6, crc2recv)) return false;
+    if (!ltc_pec15_verify(ic1rx, 6, crc1recv)) return false;
+
+    memcpy(ic0, ic2rx, 6); // ic0 = IC2 (closest to ESP32)
+    memcpy(ic1, ic1rx, 6); // ic1 = IC1 (far end, through HM2101)
+    return true;
+}
+
+// Write one register group to both ICs simultaneously.
+// ic0_data = IC2 (closest to ESP32), ic1_data = IC1 (furthest, through HM2101).
+// Daisy-chain write: first bytes clocked in get pushed to the far end (IC1),
+// last bytes stay in the closest IC (IC2). So IC1's data goes first, IC2's last.
+static void writeGroup(uint16_t cmd, const uint8_t ic0_data[6], const uint8_t ic1_data[6]) {
+    uint8_t cmdBuf[4];
+    buildCmd(cmd, cmdBuf);
+
+    uint16_t crc_ic2 = ltc_pec15_calc((uint8_t*)ic0_data, 6);  // ic0 = IC2
+    uint16_t crc_ic1 = ltc_pec15_calc((uint8_t*)ic1_data, 6);  // ic1 = IC1
+
+    // Full frame: 4 cmd + 8 IC1 (far, goes first) + 8 IC2 (close, goes last)
+    uint8_t buf[20];
+    memcpy(buf, cmdBuf, 4);
+    memcpy(buf + 4,  ic1_data, 6);       // IC1 first — pushed to far end
+    buf[10] = (crc_ic1 >> 8) & 0xFF;
+    buf[11] =  crc_ic1       & 0xFF;
+    memcpy(buf + 12, ic0_data, 6);       // IC2 last — stays in closest IC
+    buf[18] = (crc_ic2 >> 8) & 0xFF;
+    buf[19] =  crc_ic2       & 0xFF;
+
+    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+    digitalWrite(HSPI_SS, LOW);
+    hspi->transfer(buf, 20);
+    digitalWrite(HSPI_SS, HIGH);
+    hspi->endTransaction();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  LTC6811-1 — Wakeup
+// ════════════════════════════════════════════════════════════════════════════
+
+void ltc_wakeup_sleep() {
+    // CS low pulse wakes IC2 (closest to ESP32) from SLEEP → STANDBY
+    digitalWrite(HSPI_SS, LOW);
+    delayMicroseconds(400);  // tWAKE max 400µs
+    digitalWrite(HSPI_SS, HIGH);
+    delay(5);  // tREFUP max 4.4ms — reference stabilises
+
+    // Dummy RDCFGA causes IC2 to generate an isoSPI wake pulse to IC1
+    uint8_t cmdBuf[4];
+    buildCmd(LTC_RDCFGA, cmdBuf);
+    uint8_t rx[16] = {0}; // 2 ICs × 8 bytes — discard
+
+    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+    digitalWrite(HSPI_SS, LOW);
+    hspi->transfer(cmdBuf, 4);
+    hspi->transfer(rx, 16);
+    digitalWrite(HSPI_SS, HIGH);
+    hspi->endTransaction();
+
+    delay(5); // IC2 tREFUP max 4.4ms — reference must stabilise before first real command.
+              // tIDLE (isoSPI idle timeout) min is ~5.5ms so 5ms still leaves
+              // ~500µs margin before the isoSPI link times out.
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_wakeup_idle — wake both ICs from IDLE (isoSPI timed out after ~5ms)
+//  Any SPI activity is enough — no need for a long CS hold
+// ════════════════════════════════════════════════════════════════════════════
+
+void ltc_wakeup_idle() {
+    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+    digitalWrite(HSPI_SS, LOW);
+    uint8_t dummy = 0xFF;
+    hspi->transfer(dummy);
+    digitalWrite(HSPI_SS, HIGH);
+    hspi->endTransaction();
+    delayMicroseconds(10); // tREADY
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_write_config — write LtcConfig to both ICs
+// ════════════════════════════════════════════════════════════════════════════
+
+// Encode an LtcConfig into the 6 raw CFGR bytes
+static void encodeConfig(const LtcConfig &cfg, uint8_t d[6]) {
+    memset(d, 0, 6);
+    // CFGR0: GPIO[4:0] pull-down enables | REFON | ADCOPT
+    d[0] = cfg.adcopt ? 0x01 : 0x00;
+    d[0] |= cfg.refon  ? 0x04 : 0x00;
+    for (int i = 0; i < 5; i++) {
+        if (!cfg.gpio_pulldown[i]) d[0] |= (1 << (i + 3)); //1=OFF
+    }
+    // CFGR1: VUV[7:0]
+    d[1] = cfg.vuv & 0xFF;
+    // CFGR2: VUV[11:8] in low nibble, VOV[3:0] in high nibble
+    d[2] = ((cfg.vuv >> 8) & 0x0F) | ((cfg.vov & 0x0F) << 4);
+    // CFGR3: VOV[11:4]
+    d[3] = (cfg.vov >> 4) & 0xFF;
+    // CFGR4: DCC[7:0]
+    d[4] = cfg.dcc & 0xFF;
+    // CFGR5: DCC[11:8] low nibble, DCTO high nibble
+    d[5] = ((cfg.dcc >> 8) & 0x0F) | ((cfg.dcto & 0x0F) << 4);
+}
+
+// cfg[0] = IC2 (closest to ESP32), cfg[1] = IC1 (furthest, through HM2101)
+void ltc_write_config(const LtcConfig cfg[2]) {
+    uint8_t d0[6], d1[6];
+    encodeConfig(cfg[0], d0); // IC2
+    encodeConfig(cfg[1], d1); // IC1
+    writeGroup(LTC_WRCFGA, d0, d1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_read_config — read CFGR back from both ICs and decode
+// ════════════════════════════════════════════════════════════════════════════
+
+static void decodeConfig(const uint8_t d[6], LtcConfig &cfg) {
+    cfg.adcopt = d[0] & 0x01;
+    cfg.refon  = (d[0] >> 2) & 0x01;
+    for (int i = 0; i < 5; i++) cfg.gpio_pulldown[i] = !((d[0] >> (i + 3)) & 0x01);
+    cfg.vuv  = (uint16_t)d[1] | (((uint16_t)d[2] & 0x0F) << 8);
+    cfg.vov  = ((uint16_t)(d[2] >> 4)) | ((uint16_t)d[3] << 4);
+    cfg.dcc  = (uint16_t)d[4] | (((uint16_t)d[5] & 0x0F) << 8);
+    cfg.dcto = (d[5] >> 4) & 0x0F;
+}
+
+// cfg_out[0] = IC2 (closest to ESP32), cfg_out[1] = IC1 (furthest)
+bool ltc_read_config(LtcConfig cfg_out[2]) {
+    uint8_t ic0[6], ic1[6];
+    if (!readGroup(LTC_RDCFGA, ic0, ic1)) return false;
+    decodeConfig(ic0, cfg_out[0]);
+    decodeConfig(ic1, cfg_out[1]);
+    return true;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_start_adc_conversion — broadcast ADCV and/or ADAX, poll until done
+// ════════════════════════════════════════════════════════════════════════════
+
+bool ltc_start_adc_conversion(bool cells, bool gpio) {
+    if (cells) sendCmd(LTC_ADCV);
+    if (gpio)  sendCmd(LTC_ADAX);
+
+    // Poll PLADC — SDO held low while any IC is still converting
+    // Normal mode max: ~2.5ms for 12 cells
+    uint8_t cmdBuf[4];
+    buildCmd(LTC_PLADC, cmdBuf);
+
+    uint32_t start = micros();
+    while (micros() - start < 4000) {
+        delayMicroseconds(100);
+        uint8_t rx = 0x00;
+        hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+        digitalWrite(HSPI_SS, LOW);
+        hspi->transfer(cmdBuf, 4);
+        rx = hspi->transfer(0xFF);
+        digitalWrite(HSPI_SS, HIGH);
+        hspi->endTransaction();
+        if (rx == 0xFF) return true;
+    }
+    return false; // Timeout
+}
+
+bool ltc_read_voltages(measurement_data_t *meas) {
+  // Start cell ADC conversion and poll until complete (or timeout).
+  // Self-contained — callers never need to issue ADCV separately.
+  // ltc_start_adc_conversion() handles the PLADC busy-poll internally.
+  if (!ltc_start_adc_conversion(true, false)) {
+      Serial.println("[ltc] ADCV conversion timeout");
+      return false;
+  }
+
+  uint8_t ic0[6], ic1[6];
+  float    grpV[3];
+  uint16_t grpR[3];
+
+  // ── Group A: IC1 cells 0–2, IC2 cells 0–2 ───────────────────────────────
+  if (!readGroup(LTC_RDCVA, ic0, ic1)) return false;
+  parseGroup(ic0, grpV, grpR);
+  meas->cell_v[0][0]=grpV[0]; meas->cell_v[0][1]=grpV[1]; meas->cell_v[0][2]=grpV[2];
+  meas->cell_raw[0][0]=grpR[0]; meas->cell_raw[0][1]=grpR[1]; meas->cell_raw[0][2]=grpR[2];
+  parseGroup(ic1, grpV, grpR);
+  meas->cell_v[1][0]=grpV[0]; meas->cell_v[1][1]=grpV[1]; meas->cell_v[1][2]=grpV[2];
+  meas->cell_raw[1][0]=grpR[0]; meas->cell_raw[1][1]=grpR[1]; meas->cell_raw[1][2]=grpR[2];
+
+  // ── Group B: IC1 cells 3–5, IC2 cells 3–5 ───────────────────────────────
+  if (!readGroup(LTC_RDCVB, ic0, ic1)) return false;
+  parseGroup(ic0, grpV, grpR);
+  meas->cell_v[0][3]=grpV[0]; meas->cell_v[0][4]=grpV[1]; meas->cell_v[0][5]=grpV[2];
+  meas->cell_raw[0][3]=grpR[0]; meas->cell_raw[0][4]=grpR[1]; meas->cell_raw[0][5]=grpR[2];
+  parseGroup(ic1, grpV, grpR);
+  meas->cell_v[1][3]=grpV[0]; meas->cell_v[1][4]=grpV[1]; meas->cell_v[1][5]=grpV[2];
+  meas->cell_raw[1][3]=grpR[0]; meas->cell_raw[1][4]=grpR[1]; meas->cell_raw[1][5]=grpR[2];
+
+  // ── Group C: IC1 cells 6–8, IC2 cells 6–8 ───────────────────────────────
+  if (!readGroup(LTC_RDCVC, ic0, ic1)) return false;
+  parseGroup(ic0, grpV, grpR);
+  meas->cell_v[0][6]=grpV[0]; meas->cell_v[0][7]=grpV[1]; meas->cell_v[0][8]=grpV[2];
+  meas->cell_raw[0][6]=grpR[0]; meas->cell_raw[0][7]=grpR[1]; meas->cell_raw[0][8]=grpR[2];
+  parseGroup(ic1, grpV, grpR);
+  meas->cell_v[1][6]=grpV[0]; meas->cell_v[1][7]=grpV[1]; meas->cell_v[1][8]=grpV[2];
+  meas->cell_raw[1][6]=grpR[0]; meas->cell_raw[1][7]=grpR[1]; meas->cell_raw[1][8]=grpR[2];
+
+  // ── Group D: IC1 cell 9 only, IC2 cell 9 only (C11/C12 unused) ──────────
+  if (!readGroup(LTC_RDCVD, ic0, ic1)) return false;
+  parseGroup(ic0, grpV, grpR);
+  meas->cell_v[0][9]=grpV[0]; meas->cell_raw[0][9]=grpR[0];
+  parseGroup(ic1, grpV, grpR);
+  meas->cell_v[1][9]=grpV[0]; meas->cell_raw[1][9]=grpR[0];
+
+  return true;
+}
+
+// Parse 3 cells from a 6-byte group — saves both float V and raw counts
+static void parseGroup(uint8_t *raw, float *outV, uint16_t *outRaw) {
+  for (int i = 0; i < 3; i++) {
+    uint16_t val = (uint16_t)raw[i*2] | ((uint16_t)raw[i*2+1] << 8);
+    outV[i]   = val * 0.0001f;
+    outRaw[i] = val;
+  }
+}
+
+
+static float ntcToTemp(float vgpio, float vref2) {
+  if (vref2 < 0.01f) return -99.0f;  // guard divide-by-zero
+  float rntc = NTC_RBIAS * vgpio / (vref2 - vgpio);
+  if (rntc <= 0.0f) return -99.0f;
+  float tK = 1.0f / (logf(rntc / NTC_R25) / NTC_BETA + 1.0f / 298.15f);
+  return tK - 273.15f;
+}
+
+bool ltc_read_temperatures(measurement_data_t *meas) {
+  // Start GPIO ADC conversion and poll until complete, consistent with
+  // ltc_read_voltages. Fixed delay(10) replaced — PLADC poll is reliable
+  // across all ADC modes and doesn't over-wait.
+  if (!ltc_start_adc_conversion(false, true)) {
+      Serial.println("[ltc] ADAX conversion timeout");
+      return false;
+  }
+ 
+  uint8_t ic0[6], ic1[6];
+ 
+  if (!readGroup(LTC_RDAUXA, ic0, ic1)) return false;
+ 
+  float ic1_g1 = ((uint16_t)ic0[0] | ((uint16_t)ic0[1] << 8)) * 0.0001f;
+  float ic1_g2 = ((uint16_t)ic0[2] | ((uint16_t)ic0[3] << 8)) * 0.0001f;
+  float ic1_g3 = ((uint16_t)ic0[4] | ((uint16_t)ic0[5] << 8)) * 0.0001f;
+  float ic2_g1 = ((uint16_t)ic1[0] | ((uint16_t)ic1[1] << 8)) * 0.0001f;
+  float ic2_g2 = ((uint16_t)ic1[2] | ((uint16_t)ic1[3] << 8)) * 0.0001f;
+  float ic2_g3 = ((uint16_t)ic1[4] | ((uint16_t)ic1[5] << 8)) * 0.0001f;
+ 
+  if (!readGroup(LTC_RDAUXB, ic0, ic1)) return false;
+ 
+  float ic1_g4   = ((uint16_t)ic0[0] | ((uint16_t)ic0[1] << 8)) * 0.0001f;
+  float ic1_g5   = ((uint16_t)ic0[2] | ((uint16_t)ic0[3] << 8)) * 0.0001f;
+  float ic1_vref = ((uint16_t)ic0[4] | ((uint16_t)ic0[5] << 8)) * 0.0001f;
+  float ic2_g4   = ((uint16_t)ic1[0] | ((uint16_t)ic1[1] << 8)) * 0.0001f;
+  float ic2_g5   = ((uint16_t)ic1[2] | ((uint16_t)ic1[3] << 8)) * 0.0001f;
+  float ic2_vref = ((uint16_t)ic1[4] | ((uint16_t)ic1[5] << 8)) * 0.0001f;
+ 
+  // measurement_data_t has temps[5] — map IC1 GPIO 1–5
+  // IC2 temperatures are not stored (only 5 slots); extend if needed
+  meas->temps[0] = ntcToTemp(ic1_g1, ic1_vref);
+  meas->temps[1] = ntcToTemp(ic1_g2, ic1_vref);
+  meas->temps[2] = ntcToTemp(ic1_g3, ic1_vref);
+  meas->temps[3] = ntcToTemp(ic1_g4, ic1_vref);
+  meas->temps[4] = ntcToTemp(ic1_g5, ic1_vref);
+
+  (void)ic2_g1; (void)ic2_g2; (void)ic2_g3;
+  (void)ic2_g4; (void)ic2_g5; (void)ic2_vref;
+ 
+  return true;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_read_status — read STATA + STATB from both ICs
+// ════════════════════════════════════════════════════════════════════════════
+
+// status[0] = IC1, status[1] = IC2
+bool ltc_read_status(LtcStatus status[2]) {
+    // Must run ADSTAT first to populate status registers
+    sendCmd(LTC_ADSTAT);
+    delay(3); // ~2.5ms conversion time
+
+    uint8_t ic0[6], ic1[6];
+
+    // Status group A: SC[15:0], ITMP[15:0], VA[15:0]
+    if (!readGroup(LTC_RDSTATA, ic0, ic1)) return false;
+
+    for (int ic = 0; ic < 2; ic++) {
+        uint8_t *d = (ic == 0) ? ic0 : ic1;
+        LtcStatus &s = status[ic];
+
+        uint16_t sc_raw   = (uint16_t)d[0] | ((uint16_t)d[1] << 8);
+        uint16_t itmp_raw = (uint16_t)d[2] | ((uint16_t)d[3] << 8);
+        uint16_t va_raw   = (uint16_t)d[4] | ((uint16_t)d[5] << 8);
+
+        // SC = sum of cells: raw * 0.0001V * 20 (internal scaling factor)
+        s.sc_v   = sc_raw * 0.0001f * 20.0f;
+        // ITMP: (raw * 0.0001V / 7.5mV per °C) — 273°C offset per datasheet
+        s.itmp_c = (itmp_raw * 0.0001f / 0.0075f) - 273.0f;
+        s.va_v   = va_raw * 0.0001f;
+    }
+
+    // Status group B: VD[15:0], C_UV/C_OV flags, MUXFAIL, THSD, REV
+    if (!readGroup(LTC_RDSTATB, ic0, ic1)) return false;
+
+    for (int ic = 0; ic < 2; ic++) {
+        uint8_t *d = (ic == 0) ? ic0 : ic1;
+        LtcStatus &s = status[ic];
+
+        uint16_t vd_raw = (uint16_t)d[0] | ((uint16_t)d[1] << 8);
+        s.vd_v = vd_raw * 0.0001f;
+
+        // d[2]: C4UV|C3UV|C2UV|C1UV flags (bits 7:4:2:0 pairs)
+        // d[3]: C8UV|C7UV|C6UV|C5UV
+        // d[4]: C12UV|C11UV|C10UV|C9UV
+        // Each cell has 2 bits: bit0=UV, bit1=OV
+        for (int c = 0; c < 12; c++) {
+            uint8_t byte_idx = 2 + (c / 4);
+            uint8_t bit_pos  = (c % 4) * 2;
+            s.c_uv[c] = (d[byte_idx] >> bit_pos) & 0x01;
+            s.c_ov[c] = (d[byte_idx] >> (bit_pos + 1)) & 0x01;
+        }
+
+        s.muxfail = (d[5] >> 1) & 0x01;
+        s.thsd    = (d[5] >> 0) & 0x01;
+        for (int i = 0; i < 4; i++) s.rev[i] = (d[5] >> (4 + i)) & 0x01;
+    }
+
+    return true;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_scope_loop — continuously send WRCOMM/RDCOMM until Serial keypress
+//  Use this to hold a stable signal on the isoSPI lines for scope probing.
+// ════════════════════════════════════════════════════════════════════════════
+
+void ltc_scope_loop() {
+    Serial.println("\n  [SCOPE] Continuously sending WRCOMM/RDCOMM...");
+    Serial.println("  [SCOPE] Press any key to stop.");
     Serial.flush();
-    while (Serial.available()) Serial.read();   // drain stale bytes
+
+    const uint8_t pattern[6] = {0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12};
+    const uint8_t zeros[6]   = {0};
+    uint32_t count  = 0;
+    uint32_t fails  = 0;
+
+    while (Serial.available()) Serial.read();  // drain stale bytes
+
     while (!Serial.available()) {
         esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        ltc_wakeup_idle();
+        writeGroup(LTC_WRCOMM, pattern, pattern);
+
+        uint8_t ic0[6], ic1[6];
+        bool ok = readGroup(LTC_RDCOMM, ic0, ic1);
+        count++;
+        if (!ok) fails++;
+
+        // Print a status line every 100 iterations so you can see it's running
+        if (count % 100 == 0) {
+            Serial.printf("  [SCOPE] %lu iters  %lu PEC fails  last: %s\n",
+                          count, fails, ok ? "OK" : "FAIL");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));  // ~200 Hz — lower for faster scope trigger
     }
-    while (Serial.available())  Serial.read();  // consume the keypress
+
+    while (Serial.available()) Serial.read();  // consume keypress
+    writeGroup(LTC_WRCOMM, zeros, zeros);      // leave COMM register clean
+    Serial.printf("  [SCOPE] Done. %lu iters, %lu PEC fails (%.1f%%)\n",
+                  count, fails, count ? (fails * 100.0f / count) : 0.0f);
 }
 
-// ============================================================================
-// Formatting helpers
-// ============================================================================
+// ════════════════════════════════════════════════════════════════════════════
+//  ltc_comms_test — write known pattern to COMM register, read back, verify
+// ════════════════════════════════════════════════════════════════════════════
 
-static void print_section(int num, const char *title) {
-    esp_task_wdt_reset();
-    // Use plain ASCII dashes — box-drawing chars are 3-byte UTF-8 so strlen()
-    // would give wrong padding counts and corrupt the border alignment.
-    Serial.printf("\n+-- TEST %d: %s ", num, title);
-    int pad = 36 - (int)strlen(title) - (num >= 10 ? 1 : 0);
-    for (int i = 0; i < pad; i++) Serial.print('-');
-    Serial.println("+");
-}
+bool ltc_comms_test() {
+    const uint8_t pattern[6] = {0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12};
 
-static void print_section_end() {
-    Serial.println("+------------------------------------------------+");
-}
+    // Write same pattern to both ICs
+    writeGroup(LTC_WRCOMM, pattern, pattern);
 
-// Print current fault register + FSM state — useful after any failure
-static void print_debug_state() {
-    Serial.printf("  [DBG] Fault register : 0x%04X\n", fault_get());
-    Serial.printf("  [DBG] FSM state      : %d\n",
-                  static_cast<uint8_t>(fsm_get_state(g_fsm)));
-}
+    // Read back
+    uint8_t ic0[6], ic1[6];
+    if (!readGroup(LTC_RDCOMM, ic0, ic1)) {
+        Serial.println("[ltc_comms_test] PEC failed on readback");
 
-// Record and print a single test result. On failure, dumps debug state
-// and waits for a keypress so you can inspect hardware before moving on.
-static bool test_result(const char *name, bool passed) {
-    s_tests_run++;
-    if (passed) s_tests_passed++;
-    Serial.printf("  [%s] %s\n", passed ? "PASS" : "FAIL", name);
-    if (!passed) {
-        print_debug_state();
-        wait_for_keypress("Test failed — inspect hardware, then press any key to continue");
+        // ── TEMPORARY DEBUG DUMP ──────────────────────────────────────────
+        // Re-read raw bytes without PEC checking so we can see what came back
+        uint8_t cmdBuf[4];
+        buildCmd(LTC_RDCOMM, cmdBuf);
+        uint8_t rxBuf[16] = {0};
+        hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+        digitalWrite(HSPI_SS, LOW);
+        hspi->transfer(cmdBuf, 4);
+        hspi->transfer(rxBuf, 16);
+        digitalWrite(HSPI_SS, HIGH);
+        hspi->endTransaction();
+
+        Serial.println("[dbg] Raw RDCOMM response:");
+        Serial.printf("  bytes 0-7  (IC1): ");
+        for (int i = 0; i < 8; i++) Serial.printf("%02X ", rxBuf[i]);
+        Serial.println();
+        Serial.printf("  bytes 8-15 (IC2): ");
+        for (int i = 8; i < 16; i++) Serial.printf("%02X ", rxBuf[i]);
+        Serial.println();
+        Serial.printf("  expected data   : 78 9A BC DE F0 12 [PEC_HI PEC_LO]\n");
+
+        uint16_t expected_pec = ltc_pec15_calc((uint8_t*)pattern, 6);
+        Serial.printf("  expected PEC    : %02X %02X\n",
+                      (expected_pec >> 8) & 0xFF,
+                       expected_pec       & 0xFF);
+        // ── END DEBUG DUMP ────────────────────────────────────────────────
+
+        const uint8_t zeros[6] = {0};
+        writeGroup(LTC_WRCOMM, zeros, zeros);
+        return false;
     }
-    return passed;
-}
 
-// ============================================================================
-// task_test — runs once, suspends on completion
-// ============================================================================
-static void task_test(void *pvParameters) {
-    esp_task_wdt_add(NULL);  // register this task with the hardware WDT
-    vTaskDelay(pdMS_TO_TICKS(200));
+    bool ic1_ok = memcmp(pattern, ic0, 6) == 0;
+    bool ic2_ok = memcmp(pattern, ic1, 6) == 0;
 
-    Serial.println("\n╔══════════════════════════════════════════╗");
-    Serial.println("║     TronBMS Hardware Validation Test     ║");
-    Serial.println("╚══════════════════════════════════════════╝");
+    Serial.printf("[ltc_comms_test] IC1: %s  IC2: %s\n",
+                  ic1_ok ? "PASS" : "FAIL",
+                  ic2_ok ? "PASS" : "FAIL");
 
-    // ── Clear any fault bits left over from a previous run ───────────────────
-    // fault_clear() is the only clear API — call it for every defined fault bit.
-    // There is no bulk-clear or NVS-erase function in this firmware version;
-    // the previous run's snapshot remains in NVS (already reported in setup()).
-    fault_clear(static_cast<uint16_t>(FaultCode::OVERVOLTAGE));
-    fault_clear(static_cast<uint16_t>(FaultCode::UNDERVOLTAGE));
-    fault_clear(static_cast<uint16_t>(FaultCode::OVERCURRENT));
-    fault_clear(static_cast<uint16_t>(FaultCode::OVERTEMP));
-    fault_clear(static_cast<uint16_t>(FaultCode::BAL_OVERTEMP));
-    fault_clear(static_cast<uint16_t>(FaultCode::SPI_LTC));
-    fault_clear(static_cast<uint16_t>(FaultCode::SPI_ADS));
-    fault_clear(static_cast<uint16_t>(FaultCode::STARTUP));
-    fsm_set_state(g_fsm, BmsState::INIT);
-    Serial.println("  [INIT] Fault register cleared.");
-    Serial.printf( "  [INIT] Fault register after clear: 0x%04X\n", fault_get());
-
-    // ── Wait for user to signal ready ────────────────────────────────────────
-    wait_for_keypress("Ready. Press any key to BEGIN the test sequence...");
-
-    // ── Scope loop — hold signal on isoSPI lines for probing ─────────────────
-    // Remove or comment out this call when done with scope debugging.
-    ltc_scope_loop();
-
-    measurement_data_t meas = {};
-    bool ltc_comms_ok = true;  // gate flag — skips LTC tests if comms fail
-
-    // =========================================================================
-    // TEST 1 — LTC6811 comms loopback (WRCOMM / RDCOMM)
-    // =========================================================================
-    print_section(1, "LTC6811 Comms Loopback");
-    {
-        Serial.println("  Sending WRCOMM pattern and reading back via RDCOMM...");
-        bool ok = ltc_comms_test();
-        ltc_comms_ok = ok;
-
-        if (!test_result("LTC6811 WRCOMM/RDCOMM loopback (both ICs)", ok)) {
-            fault_set(static_cast<uint16_t>(FaultCode::SPI_LTC));
-            fsm_set_state(g_fsm, BmsState::FAULT);
-            Serial.println("  !! LTC comms failure is unrecoverable for this run.");
-            Serial.println("  !! Skipping all remaining LTC tests (Tests 2–4).");
-            Serial.println("  !! Check: SPI wiring, CS lines, LTC6811 power rails.");
-        }
-    }
-    print_section_end();
-
-    // =========================================================================
-    // TEST 2 — LTC6811 config write/readback (REFON=1, DCC=0)
-    // =========================================================================
-    print_section(2, "LTC6811 Config Write/Readback");
-    if (!ltc_comms_ok) {
-        Serial.println("  [SKIP] LTC comms failed — skipping.");
-    } else {
-        LtcConfig cfg_write[TOTAL_IC] = {};
-        for (int ic = 0; ic < TOTAL_IC; ic++) {
-            cfg_write[ic].refon   = true;
-            cfg_write[ic].adcopt  = false;
-            cfg_write[ic].dcto    = 0x00;
-            cfg_write[ic].dcc     = 0x0000;
-            cfg_write[ic].vuv     = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
-            cfg_write[ic].vov     = (uint16_t) (CELL_OV_RAW / 16u);
-            for (int g = 0; g < 5; g++) cfg_write[ic].gpio_pulldown[g] = false;
-        }
-
-        Serial.printf("  Writing: REFON=1, DCC=0, VUV=0x%03X, VOV=0x%03X\n",
-                      cfg_write[0].vuv, cfg_write[0].vov);
-        ltc_write_config(cfg_write);
-        vTaskDelay(pdMS_TO_TICKS(2));
-
-        LtcConfig cfg_read[TOTAL_IC] = {};
-        bool readback_ok = ltc_read_config(cfg_read);
-        test_result("RDCFGA PEC valid", readback_ok);
-
-        if (readback_ok) {
-            for (int ic = 0; ic < TOTAL_IC; ic++) {
-                bool refon_ok = (cfg_read[ic].refon == cfg_write[ic].refon);
-                bool vuv_ok   = (cfg_read[ic].vuv   == cfg_write[ic].vuv);
-                bool vov_ok   = (cfg_read[ic].vov   == cfg_write[ic].vov);
-                bool dcc_ok   = (cfg_read[ic].dcc   == 0x0000);
-
-                // index 0 = IC2 (closest), index 1 = IC1 (furthest)
-                const char *ic_name = (ic == 0) ? "IC2(close)" : "IC1(far)";
-
-                Serial.printf("  %s read:  REFON=%d  VUV=0x%03X  VOV=0x%03X  DCC=0x%03X\n",
-                              ic_name,
-                              cfg_read[ic].refon,
-                              cfg_read[ic].vuv,
-                              cfg_read[ic].vov,
-                              cfg_read[ic].dcc);
-                Serial.printf("  %s expect: REFON=%d  VUV=0x%03X  VOV=0x%03X  DCC=0x000\n",
-                              ic_name,
-                              cfg_write[ic].refon,
-                              cfg_write[ic].vuv,
-                              cfg_write[ic].vov);
-
-                char label[56];
-                snprintf(label, sizeof(label), "%s REFON/VUV/VOV/DCC match", ic_name);
-                test_result(label, refon_ok && vuv_ok && vov_ok && dcc_ok);
-            }
-        } else {
-            fault_set(static_cast<uint16_t>(FaultCode::SPI_LTC));
-            fsm_set_state(g_fsm, BmsState::FAULT);
-            Serial.println("  !! PEC error on RDCFGA. Check SPI noise / decoupling.");
-        }
-
-    }
-    print_section_end();
-
-    // =========================================================================
-    // TEST 3 — Cell voltage read
-    // =========================================================================
-    print_section(3, "Cell Voltages");
-    if (!ltc_comms_ok) {
-        Serial.println("  [SKIP] LTC comms failed — skipping.");
-    } else {
-        Serial.println("  Issuing ADCV and reading all cell registers...");
-        bool ok = ltc_read_voltages(&meas);
-        test_result("ltc_read_voltages() PEC valid", ok);
-
-        if (ok) {
-            bool any_ov = false, any_uv = false, any_zero = false;
-            for (int ic = 0; ic < TOTAL_IC; ic++) {
-                Serial.printf("  --- IC%d ---\n", ic + 1);
-                for (int c = 0; c < CELLS_PER_IC; c++) {
-                    float v    = meas.cell_v[ic][c];
-                    bool  ov   = (v >= CELL_OV_V);
-                    bool  uv   = (v <= CELL_UV_V);
-                    bool  zero = (v < 0.01f);
-                    if (ov)   any_ov   = true;
-                    if (uv)   any_uv   = true;
-                    if (zero) any_zero = true;
-                    Serial.printf("    C%02d: %6.4f V%s%s%s\n",
-                                  c + 1, v,
-                                  ov   ? "  ← OV"                    : "",
-                                  uv   ? "  ← UV"                    : "",
-                                  zero ? "  ← ZERO (open circuit?)"  : "");
-                }
-            }
-            test_result("No cells at 0V (open circuit check)", !any_zero);
-            test_result("No cell OV",  !any_ov);
-            test_result("No cell UV",  !any_uv);
-
-            if (any_ov) { fault_set(static_cast<uint16_t>(FaultCode::OVERVOLTAGE)); fsm_set_state(g_fsm, BmsState::FAULT); }
-            if (any_uv) { fault_set(static_cast<uint16_t>(FaultCode::UNDERVOLTAGE)); fsm_set_state(g_fsm, BmsState::FAULT); }
-        } else {
-            fault_set(static_cast<uint16_t>(FaultCode::SPI_LTC));
-            fsm_set_state(g_fsm, BmsState::FAULT);
-            Serial.println("  !! PEC error reading cell voltages. Check wiring to LTC6811.");
-        }
-
-    }
-    print_section_end();
-
-    // =========================================================================
-    // TEST 4 — Temperature read
-    // =========================================================================
-    print_section(4, "Temperatures");
-    if (!ltc_comms_ok) {
-        Serial.println("  [SKIP] LTC comms failed — skipping.");
-    } else {
-        Serial.println("  Reading GPIO ADC channels for NTC temperatures...");
-        bool ok = ltc_read_temperatures(&meas);
-        test_result("ltc_read_temperatures() PEC valid", ok);
-
-        if (ok) {
-            bool any_ot   = false;
-            bool any_open = false;
-            for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-                float t    = meas.temps[i];
-                bool  ot   = (t >= (float)TEMP_CUTOFF_C);
-                bool  open = (t < -50.0f);
-                if (ot)   any_ot   = true;
-                if (open) any_open = true;
-                Serial.printf("    Sensor %d: %6.1f °C%s%s\n",
-                              i, t,
-                              ot   ? "  ← OT"                    : "",
-                              open ? "  ← OPEN/SHORT (check NTC)" : "");
-            }
-            test_result("No sensors open/shorted", !any_open);
-            test_result("No sensors over TEMP_CUTOFF_C", !any_ot);
-
-            if (any_ot) { fault_set(static_cast<uint16_t>(FaultCode::OVERTEMP)); fsm_set_state(g_fsm, BmsState::FAULT); }
-        } else {
-            fault_set(static_cast<uint16_t>(FaultCode::SPI_LTC));
-            fsm_set_state(g_fsm, BmsState::FAULT);
-            Serial.println("  !! PEC error reading temperatures. Check GPIO mux / NTC wiring.");
-        }
-
-    }
-    print_section_end();
-
-    // =========================================================================
-    // TEST 5 — ADS131M02 configure + ID verify
-    // =========================================================================
-    print_section(5, "ADS131M02 Configure + ID");
-    {
-        Serial.println("  Writing CLOCK and GAIN1 registers, reading back...");
-        bool cfg_ok = ads_configure();
-        test_result("ADS131M02 CLOCK + GAIN1 register readback match", cfg_ok);
-
-        Serial.println("  Reading ID register, expecting 0x2282...");
-        bool id_ok = ads_checkid();
-        test_result("ADS131M02 ID register matches 0x2282", id_ok);
-
-        if (!cfg_ok || !id_ok) {
-            fault_set(static_cast<uint16_t>(FaultCode::SPI_ADS));
-            fsm_set_state(g_fsm, BmsState::FAULT);
-            Serial.println("  !! Check: SPI2 wiring, ADS131M02 power rail, CS line.");
-        }
-
-    }
-    print_section_end();
-
-    // =========================================================================
-    // TEST 6 — ADS131M02 current read
-    // =========================================================================
-    print_section(6, "ADS131M02 Current Sense");
-    {
-        const int N = 8;
-        Serial.printf("  Taking %d samples and averaging...\n", N);
-
-        int32_t sum = 0;
-        for (int i = 0; i < N; i++) {
-            int32_t raw = ads_read_raw();
-            Serial.printf("    Sample %d: %ld counts\n", i + 1, (long)raw);
-            sum += raw;
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        int32_t avg_raw = sum / N;
-        float   amps    = ads_counts_to_amps(avg_raw);
-        meas.current_a  = amps;
-
-        Serial.printf("  Average raw : %ld counts\n", (long)avg_raw);
-        Serial.printf("  Current     : %.3f A  (expect ~0 A at rest)\n", amps);
-
-        bool idle_ok = (amps > -2.0f && amps < 2.0f);
-        test_result("Idle current within ±2 A of zero", idle_ok);
-        if (!idle_ok)
-            Serial.println("  !! Check: shunt wiring, gain config, ADS131M02 Vref.");
-
-        bool oc = meas_check_overcurrent(&meas);
-        test_result("meas_check_overcurrent() — no fault at rest", !oc);
-        if (oc) { fault_set(static_cast<uint16_t>(FaultCode::OVERCURRENT)); fsm_set_state(g_fsm, BmsState::FAULT); }
-
-    }
-    print_section_end();
-
-    // =========================================================================
-    // TEST 7 — Gate driver selftest
-    // =========================================================================
-    print_section(7, "Gate Driver");
-    {
-        Serial.println("  Pulsing CHG and DSG outputs LOW...");
-        bool ok = gate_driver_selftest();
-        test_result("gate_driver_selftest() returned true", ok);
-        Serial.println("  >> Verify with multimeter: CHG and DSG outputs = LOW");
-        if (!ok) {
-            fault_set(static_cast<uint16_t>(FaultCode::STARTUP));
-            fsm_set_state(g_fsm, BmsState::FAULT);
-            Serial.println("  !! Check: gate driver power rail, output enable pin.");
-        }
-    }
-    print_section_end();
-
-    // =========================================================================
-    // SUMMARY
-    // =========================================================================
+    // Dump raw bytes even on success so we can verify ordering
+    Serial.printf("  IC1 data: ");
+    for (int i = 0; i < 6; i++) Serial.printf("%02X ", ic0[i]);
     Serial.println();
-    Serial.println("╔══════════════════════════════════════════╗");
-    Serial.println("║               TEST SUMMARY               ║");
-    Serial.println("╠══════════════════════════════════════════╣");
-    Serial.printf( "║  Tests run    : %-25d║\n", s_tests_run);
-    Serial.printf( "║  Tests passed : %-25d║\n", s_tests_passed);
-    Serial.printf( "║  Tests failed : %-25d║\n", s_tests_run - s_tests_passed);
-    Serial.println("╠══════════════════════════════════════════╣");
-    if (s_tests_passed == s_tests_run) {
-        Serial.println("║  STATUS : ALL PASS ✓                     ║");
-    } else {
-        Serial.println("║  STATUS : FAILED ✗                       ║");
-    }
-    Serial.println("╠══════════════════════════════════════════╣");
-    Serial.printf( "║  FSM state    : %-25d║\n",
-                   static_cast<uint8_t>(fsm_get_state(g_fsm)));
-    Serial.printf( "║  Fault reg    : 0x%04X%-19s║\n", fault_get(), "");
-    Serial.println("╚══════════════════════════════════════════╝");
-    Serial.println("  task_test done. Reset ESP32 to run again.");
-    Serial.flush();
+    Serial.printf("  IC2 data: ");
+    for (int i = 0; i < 6; i++) Serial.printf("%02X ", ic1[i]);
+    Serial.println();
 
-    // Deregister from the hardware WDT before deleting the task.
-    // vTaskSuspend would stop feeding the WDT and trigger a reset.
-    esp_task_wdt_delete(NULL);
-    vTaskDelete(nullptr);
-}
+    // Zero COMM register — leave no dirty pattern behind
+    const uint8_t zeros[6] = {0};
+    writeGroup(LTC_WRCOMM, zeros, zeros);
 
-// ============================================================================
-// setup / loop
-// ============================================================================
-void setup() {
-    Serial.begin(115200);
-    delay(500);
-    Serial.println("[main] TronBMS test build starting...");
-    Serial.println("[main] Press any key to begin hardware init...");
-    Serial.flush();
-    while (Serial.available()) Serial.read();
-    while (!Serial.available()) delay(50);
-    while (Serial.available())  Serial.read();
-    Serial.println("[main] Starting...");
-
-    // NVS init
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-
-    // Hardware init
-    bms_gpio_init();
-    bms_spi_init();
-
-    // Wake LTC chain immediately — before FSM or any other hardware access
-    ltc_wakeup_sleep();
-    ltc_wakeup_idle();
-    Serial.println("[main] LTC chain wakeup sent.");
-
-    // RTOS primitives
-    g_event_group    = xEventGroupCreate();
-    g_meas_mutex     = xSemaphoreCreateMutex();
-    g_snapshot_mutex = xSemaphoreCreateMutex();
-    g_meas_queue     = xQueueCreate(2, sizeof(measurement_data_t));
-
-    // FSM init — starts in INIT state, contactors open
-    fsm_init(g_fsm);
-
-    // Report any fault from the previous run (before task_test clears it)
-    fault_snapshot_t prev_snap = {};
-    if (fault_log_read(&prev_snap)) {
-        Serial.printf("[main] Previous run fault: code=%d  state_at_fault=%d\n",
-                      static_cast<uint8_t>(prev_snap.code),
-                      static_cast<uint8_t>(prev_snap.state_at_fault));
-    } else {
-        Serial.println("[main] No fault logged from previous run.");
-    }
-
-    // Spawn only the tasks needed for this test build.
-    // task_watchdog is intentionally omitted — its software checks for
-    // task_measure and task_daq would immediately fire since those tasks are
-    // not spawned in this build. task_test feeds the hardware WDT directly.
-    // task_balance and task_daq are also omitted.
-    xTaskCreatePinnedToCore(task_fsm,  "fsm",  8192, nullptr, 4, nullptr, 1);
-    xTaskCreatePinnedToCore(task_test, "test", 8192, nullptr, 3, nullptr, 1);
-
-    Serial.println("[main] Tasks running — waiting for test output.");
-}
-
-void loop() {
-    vTaskDelay(portMAX_DELAY);
+    return ic1_ok && ic2_ok;
 }
