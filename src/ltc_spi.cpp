@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include "esp_task_wdt.h"
 #include "bms_config.h"
 #include "ltc_spi.h"
 
@@ -100,18 +101,20 @@ static bool readGroup(uint16_t cmd, uint8_t ic0[6], uint8_t ic1[6]) {
     digitalWrite(HSPI_SS, HIGH);
     hspi->endTransaction();
 
-    // Daisy-chain: first 8 bytes = IC2, last 8 bytes = IC1
-    uint8_t *ic2rx = rxBuf;
-    uint8_t *ic1rx = rxBuf + 8;
+    // Daisy-chain RX order: data shifts out furthest-IC-first.
+    // IC1 is furthest from ESP32, IC2 is closest.
+    // Therefore: first 8 bytes received = IC1, last 8 bytes = IC2.
+    uint8_t *ic1rx = rxBuf;
+    uint8_t *ic2rx = rxBuf + 8;
 
-    uint16_t crc2recv = ((uint16_t)ic2rx[6] << 8) | ic2rx[7];
     uint16_t crc1recv = ((uint16_t)ic1rx[6] << 8) | ic1rx[7];
+    uint16_t crc2recv = ((uint16_t)ic2rx[6] << 8) | ic2rx[7];
 
-    if (!ltc_pec15_verify(ic2rx, 6, crc2recv)) return false;
     if (!ltc_pec15_verify(ic1rx, 6, crc1recv)) return false;
+    if (!ltc_pec15_verify(ic2rx, 6, crc2recv)) return false;
 
-    memcpy(ic0, ic1rx, 6); // ic0 = IC1 (closer to ESP32)
-    memcpy(ic1, ic2rx, 6); // ic1 = IC2 (far end of chain)
+    memcpy(ic0, ic1rx, 6); // ic0 = IC1 (far end of chain)
+    memcpy(ic1, ic2rx, 6); // ic1 = IC2 (closest to ESP32)
     return true;
 }
 
@@ -147,13 +150,13 @@ static void writeGroup(uint16_t cmd, const uint8_t ic0_data[6], const uint8_t ic
 // ════════════════════════════════════════════════════════════════════════════
 
 void ltc_wakeup_sleep() {
-    // CS low pulse wakes IC1 from SLEEP → STANDBY
+    // CS low pulse wakes IC2 (closest to ESP32) from SLEEP → STANDBY
     digitalWrite(HSPI_SS, LOW);
     delayMicroseconds(400);  // tWAKE max 400µs
     digitalWrite(HSPI_SS, HIGH);
     delay(5);  // tREFUP max 4.4ms — reference stabilises
 
-    // Dummy RDCFGA causes IC1 to generate an isoSPI wake pulse to IC2
+    // Dummy RDCFGA causes IC2 to generate an isoSPI wake pulse to IC1
     uint8_t cmdBuf[4];
     buildCmd(LTC_RDCFGA, cmdBuf);
     uint8_t rx[16] = {0}; // 2 ICs × 8 bytes — discard
@@ -440,6 +443,49 @@ bool ltc_read_status(LtcStatus status[2]) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  ltc_scope_loop — continuously send WRCOMM/RDCOMM until Serial keypress
+//  Use this to hold a stable signal on the isoSPI lines for scope probing.
+// ════════════════════════════════════════════════════════════════════════════
+
+void ltc_scope_loop() {
+    Serial.println("\n  [SCOPE] Continuously sending WRCOMM/RDCOMM...");
+    Serial.println("  [SCOPE] Press any key to stop.");
+    Serial.flush();
+
+    const uint8_t pattern[6] = {0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12};
+    const uint8_t zeros[6]   = {0};
+    uint32_t count  = 0;
+    uint32_t fails  = 0;
+
+    while (Serial.available()) Serial.read();  // drain stale bytes
+
+    while (!Serial.available()) {
+        esp_task_wdt_reset();
+
+        ltc_wakeup_idle();
+        writeGroup(LTC_WRCOMM, pattern, pattern);
+
+        uint8_t ic0[6], ic1[6];
+        bool ok = readGroup(LTC_RDCOMM, ic0, ic1);
+        count++;
+        if (!ok) fails++;
+
+        // Print a status line every 100 iterations so you can see it's running
+        if (count % 100 == 0) {
+            Serial.printf("  [SCOPE] %lu iters  %lu PEC fails  last: %s\n",
+                          count, fails, ok ? "OK" : "FAIL");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));  // ~200 Hz — lower for faster scope trigger
+    }
+
+    while (Serial.available()) Serial.read();  // consume keypress
+    writeGroup(LTC_WRCOMM, zeros, zeros);      // leave COMM register clean
+    Serial.printf("  [SCOPE] Done. %lu iters, %lu PEC fails (%.1f%%)\n",
+                  count, fails, count ? (fails * 100.0f / count) : 0.0f);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  ltc_comms_test — write known pattern to COMM register, read back, verify
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -453,7 +499,34 @@ bool ltc_comms_test() {
     uint8_t ic0[6], ic1[6];
     if (!readGroup(LTC_RDCOMM, ic0, ic1)) {
         Serial.println("[ltc_comms_test] PEC failed on readback");
-        // Clear COMM register even on failure — don't leave partial data
+
+        // ── TEMPORARY DEBUG DUMP ──────────────────────────────────────────
+        // Re-read raw bytes without PEC checking so we can see what came back
+        uint8_t cmdBuf[4];
+        buildCmd(LTC_RDCOMM, cmdBuf);
+        uint8_t rxBuf[16] = {0};
+        hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+        digitalWrite(HSPI_SS, LOW);
+        hspi->transfer(cmdBuf, 4);
+        hspi->transfer(rxBuf, 16);
+        digitalWrite(HSPI_SS, HIGH);
+        hspi->endTransaction();
+
+        Serial.println("[dbg] Raw RDCOMM response:");
+        Serial.printf("  bytes 0-7  (IC1): ");
+        for (int i = 0; i < 8; i++) Serial.printf("%02X ", rxBuf[i]);
+        Serial.println();
+        Serial.printf("  bytes 8-15 (IC2): ");
+        for (int i = 8; i < 16; i++) Serial.printf("%02X ", rxBuf[i]);
+        Serial.println();
+        Serial.printf("  expected data   : 78 9A BC DE F0 12 [PEC_HI PEC_LO]\n");
+
+        uint16_t expected_pec = ltc_pec15_calc((uint8_t*)pattern, 6);
+        Serial.printf("  expected PEC    : %02X %02X\n",
+                      (expected_pec >> 8) & 0xFF,
+                       expected_pec       & 0xFF);
+        // ── END DEBUG DUMP ────────────────────────────────────────────────
+
         const uint8_t zeros[6] = {0};
         writeGroup(LTC_WRCOMM, zeros, zeros);
         return false;
@@ -465,6 +538,14 @@ bool ltc_comms_test() {
     Serial.printf("[ltc_comms_test] IC1: %s  IC2: %s\n",
                   ic1_ok ? "PASS" : "FAIL",
                   ic2_ok ? "PASS" : "FAIL");
+
+    // Dump raw bytes even on success so we can verify ordering
+    Serial.printf("  IC1 data: ");
+    for (int i = 0; i < 6; i++) Serial.printf("%02X ", ic0[i]);
+    Serial.println();
+    Serial.printf("  IC2 data: ");
+    for (int i = 0; i < 6; i++) Serial.printf("%02X ", ic1[i]);
+    Serial.println();
 
     // Zero COMM register — leave no dirty pattern behind
     const uint8_t zeros[6] = {0};

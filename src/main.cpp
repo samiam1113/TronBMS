@@ -36,6 +36,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "nvs_flash.h"
+#include "esp_task_wdt.h"
 #include "bms_config.h"
 #include "bms_types.h"
 #include "bms_fsm.h"
@@ -57,12 +58,16 @@ static int s_tests_passed = 0;
 // ============================================================================
 
 // Block until the user presses any key in Serial Monitor.
+// Feeds the hardware WDT while waiting so the ESP32 doesn't reset.
 static void wait_for_keypress(const char *prompt = nullptr) {
     if (prompt) Serial.printf("\n  >> %s\n", prompt);
     else        Serial.println("\n  >> Press any key to continue...");
     Serial.flush();
     while (Serial.available()) Serial.read();   // drain stale bytes
-    while (!Serial.available()) vTaskDelay(pdMS_TO_TICKS(50));
+    while (!Serial.available()) {
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     while (Serial.available())  Serial.read();  // consume the keypress
 }
 
@@ -71,14 +76,17 @@ static void wait_for_keypress(const char *prompt = nullptr) {
 // ============================================================================
 
 static void print_section(int num, const char *title) {
-    Serial.printf("\n┌─ TEST %d: %s ", num, title);
-    int pad = 38 - strlen(title);
-    for (int i = 0; i < pad; i++) Serial.print('─');
-    Serial.println("┐");
+    esp_task_wdt_reset();
+    // Use plain ASCII dashes — box-drawing chars are 3-byte UTF-8 so strlen()
+    // would give wrong padding counts and corrupt the border alignment.
+    Serial.printf("\n+-- TEST %d: %s ", num, title);
+    int pad = 36 - (int)strlen(title) - (num >= 10 ? 1 : 0);
+    for (int i = 0; i < pad; i++) Serial.print('-');
+    Serial.println("+");
 }
 
 static void print_section_end() {
-    Serial.println("└────────────────────────────────────────────────┘");
+    Serial.println("+------------------------------------------------+");
 }
 
 // Print current fault register + FSM state — useful after any failure
@@ -105,6 +113,7 @@ static bool test_result(const char *name, bool passed) {
 // task_test — runs once, suspends on completion
 // ============================================================================
 static void task_test(void *pvParameters) {
+    esp_task_wdt_add(NULL);  // register this task with the hardware WDT
     vTaskDelay(pdMS_TO_TICKS(200));
 
     Serial.println("\n╔══════════════════════════════════════════╗");
@@ -134,6 +143,10 @@ static void task_test(void *pvParameters) {
     ltc_wakeup_sleep();
     ltc_wakeup_idle();
     Serial.println("  [INIT] LTC chain wakeup sent.");
+
+    // ── Scope loop — hold signal on isoSPI lines for probing ─────────────────
+    // Remove or comment out this call when done with scope debugging.
+    ltc_scope_loop();
 
     measurement_data_t meas = {};
     bool ltc_comms_ok = true;  // gate flag — skips LTC tests if comms fail
@@ -393,10 +406,13 @@ static void task_test(void *pvParameters) {
                    static_cast<uint8_t>(fsm_get_state(g_fsm)));
     Serial.printf( "║  Fault reg    : 0x%04X%-19s║\n", fault_get(), "");
     Serial.println("╚══════════════════════════════════════════╝");
-    Serial.println("  task_test suspended. FSM still running.");
-    Serial.println("  Reset ESP32 to run again.");
+    Serial.println("  task_test done. Reset ESP32 to run again.");
+    Serial.flush();
 
-    vTaskSuspend(nullptr);
+    // Deregister from the hardware WDT before deleting the task.
+    // vTaskSuspend would stop feeding the WDT and trigger a reset.
+    esp_task_wdt_delete(NULL);
+    vTaskDelete(nullptr);
 }
 
 // ============================================================================
@@ -438,10 +454,12 @@ void setup() {
     }
 
     // Spawn only the tasks needed for this test build.
-    // task_balance and task_daq are intentionally omitted.
-    xTaskCreatePinnedToCore(task_fsm,      "fsm",  8192, nullptr, 4, nullptr, 1);
-    xTaskCreatePinnedToCore(task_watchdog, "wdt",  2048, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(task_test,     "test", 8192, nullptr, 3, nullptr, 1);
+    // task_watchdog is intentionally omitted — its software checks for
+    // task_measure and task_daq would immediately fire since those tasks are
+    // not spawned in this build. task_test feeds the hardware WDT directly.
+    // task_balance and task_daq are also omitted.
+    xTaskCreatePinnedToCore(task_fsm,  "fsm",  8192, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(task_test, "test", 8192, nullptr, 3, nullptr, 1);
 
     Serial.println("[main] Tasks running — waiting for test output.");
 }
