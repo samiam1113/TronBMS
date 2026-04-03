@@ -139,11 +139,6 @@ static void task_test(void *pvParameters) {
     // ── Wait for user to signal ready ────────────────────────────────────────
     wait_for_keypress("Ready. Press any key to BEGIN the test sequence...");
 
-    // ── Wake LTC chain before any register access ─────────────────────────────
-    ltc_wakeup_sleep();
-    ltc_wakeup_idle();
-    Serial.println("  [INIT] LTC chain wakeup sent.");
-
     // ── Scope loop — hold signal on isoSPI lines for probing ─────────────────
     // Remove or comment out this call when done with scope debugging.
     ltc_scope_loop();
@@ -422,6 +417,12 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("[main] TronBMS test build starting...");
+    Serial.println("[main] Press any key to begin hardware init...");
+    Serial.flush();
+    while (Serial.available()) Serial.read();
+    while (!Serial.available()) delay(50);
+    while (Serial.available())  Serial.read();
+    Serial.println("[main] Starting...");
 
     // NVS init
     esp_err_t err = nvs_flash_init();
@@ -433,6 +434,11 @@ void setup() {
     // Hardware init
     bms_gpio_init();
     bms_spi_init();
+
+    // Wake LTC chain immediately — before FSM or any other hardware access
+    ltc_wakeup_sleep();
+    ltc_wakeup_idle();
+    Serial.println("[main] LTC chain wakeup sent.");
 
     // RTOS primitives
     g_event_group    = xEventGroupCreate();
