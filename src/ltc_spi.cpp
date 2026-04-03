@@ -151,27 +151,25 @@ static void writeGroup(uint16_t cmd, const uint8_t ic0_data[6], const uint8_t ic
 // ════════════════════════════════════════════════════════════════════════════
 
 void ltc_wakeup_sleep() {
-    // CS low pulse wakes IC2 (closest to ESP32) from SLEEP → STANDBY
     digitalWrite(HSPI_SS, LOW);
-    delayMicroseconds(400);  // tWAKE max 400µs
+    delayMicroseconds(400);
     digitalWrite(HSPI_SS, HIGH);
-    delay(5);  // tREFUP max 4.4ms — reference stabilises
+    delay(10);  // extended tREFUP
 
-    // Dummy RDCFGA causes IC2 to generate an isoSPI wake pulse to IC1
-    uint8_t cmdBuf[4];
-    buildCmd(LTC_RDCFGA, cmdBuf);
-    uint8_t rx[16] = {0}; // 2 ICs × 8 bytes — discard
-
-    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
-    digitalWrite(HSPI_SS, LOW);
-    hspi->transfer(cmdBuf, 4);
-    hspi->transfer(rx, 16);
-    digitalWrite(HSPI_SS, HIGH);
-    hspi->endTransaction();
-
-    delay(5); // IC2 tREFUP max 4.4ms — reference must stabilise before first real command.
-              // tIDLE (isoSPI idle timeout) min is ~5.5ms so 5ms still leaves
-              // ~500µs margin before the isoSPI link times out.
+    // Send multiple dummy commands to ensure isoSPI wake propagates to IC1
+    for (int i = 0; i < 5; i++) {
+        uint8_t cmdBuf[4];
+        buildCmd(LTC_RDCFGA, cmdBuf);
+        uint8_t rx[16] = {0};
+        hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+        digitalWrite(HSPI_SS, LOW);
+        hspi->transfer(cmdBuf, 4);
+        hspi->transfer(rx, 16);
+        digitalWrite(HSPI_SS, HIGH);
+        hspi->endTransaction();
+        delay(2);
+    }
+    delay(5);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
