@@ -26,6 +26,11 @@
 #include "bms_balance.h"
 #include "bms_telemetry.h"
 #include "bms_tasks.h"
+#include "bms_wifi.h"
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 
 
 // ── Shared RTOS primitives ────────────────────────────────────────────────────
@@ -232,6 +237,8 @@ void task_daq(void *pvParameters) {
         if (xQueueReceive(g_meas_queue, &meas, portMAX_DELAY) == pdTRUE) {
 
             telemetry_send(&meas, fsm_get_state(g_fsm));
+
+            wifi_push_telemetry(&meas, fsm_get_state(g_fsm), fault_get());
 
             // Fix #4: take snapshot mutex before checking the flag and reading
             // the struct. The write side (fsm_on_enter FAULT) holds this same

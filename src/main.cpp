@@ -45,6 +45,7 @@
 #include "bms_measurements.h"
 #include "bms_tasks.h"
 #include "ltc_spi.h"
+#include "bms_wifi.h"
 
 // ── Global FSM context — extern'd by bms_tasks.cpp and bms_fsm.cpp ───────────
 BmsFsm g_fsm;
@@ -437,6 +438,9 @@ void setup() {
     // Hardware init
     bms_gpio_init();
     bms_spi_init();
+
+    // Wifi init
+    wifi_server_init();
 
     // Wake LTC chain immediately — before FSM or any other hardware access
     ltc_wakeup_sleep();
