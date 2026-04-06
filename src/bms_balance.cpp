@@ -110,26 +110,27 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
         return LTC_OK;
     }
 
+    // Cell index to LTC DCC bit mapping — skips C6 (index 5+ shifted by 1)
+    static const uint8_t cell_to_dcc_bit[CELLS_PER_IC] = {
+        0, 1, 2, 3, 4,   // cell 0-4 → LTC C1-C5 → DCC bits 0-4
+        6, 7, 8, 9, 10   // cell 5-9 → LTC C7-C11 → DCC bits 6-10
+    };
+
     uint16_t dcc[TOTAL_IC] = {};
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         for (int c = 0; c < CELLS_PER_IC; c++) {
             if (meas->balance_cells[ic][c]) {
-                dcc[ic] |= (uint16_t)(1u << c);
+                dcc[ic] |= (uint16_t)(1u << cell_to_dcc_bit[c]);
             }
         }
         Serial.printf("[bal] IC%d DCC mask: 0x%03X\n", ic + 1, dcc[ic]);
     }
 
     // Fix #8: read the current LTC config so we can preserve the GPIO
-    // pull-down bits that ltc_read_temperatures relies on. Writing
-    // gpio_pulldown=false unconditionally clobbered the thermistor mux
-    // configuration on every balance write.
+    // pull-down bits that ltc_read_temperatures relies on.
     LtcConfig live[TOTAL_IC];
     bool gpio_pd[5] = {false, false, false, false, false};
     if (ltc_read_config(live)) {
-        // Use IC1's GPIO state as the authoritative source — IC1 owns the
-        // thermistor GPIOs. If read fails we fall back to all-false, which
-        // is safer than using stale data.
         for (int g = 0; g < 5; g++) gpio_pd[g] = live[0].gpio_pulldown[g];
     } else {
         Serial.println("[bal] balance_apply: ltc_read_config failed — GPIO pull-downs set to false");

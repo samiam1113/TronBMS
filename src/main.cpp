@@ -45,7 +45,6 @@
 #include "bms_measurements.h"
 #include "bms_tasks.h"
 #include "ltc_spi.h"
-#include "bms_wifi.h"
 
 // ── Global FSM context — extern'd by bms_tasks.cpp and bms_fsm.cpp ───────────
 BmsFsm g_fsm;
@@ -191,6 +190,7 @@ static void task_test(void *pvParameters) {
                       cfg_write[0].vuv, cfg_write[0].vov);
         ltc_write_config(cfg_write);
         vTaskDelay(pdMS_TO_TICKS(50));  // was 2ms
+        ltc_debug_rdcfga_raw();
 
         LtcConfig cfg_read[TOTAL_IC] = {};
         bool readback_ok = ltc_read_config(cfg_read);
@@ -333,6 +333,31 @@ static void task_test(void *pvParameters) {
     }
     print_section_end();
 
+// =========================================================================
+// ADS131M02 — Continuous current monitor
+// =========================================================================
+Serial.println("\n[ADS] Opening gate drivers for current draw test...");
+gate_driver_enable();
+Serial.println("[ADS] Gate drivers OPEN — press any key to stop and close.");
+Serial.flush();
+while (Serial.available()) Serial.read();
+
+while (!Serial.available()) {
+    esp_task_wdt_reset();
+    int32_t raw = ads_read_raw();
+    float amps = ads_counts_to_amps(raw);
+    Serial.printf("[ADS] raw: %8ld  current: %8.3f A\n", (long)raw, amps);
+    vTaskDelay(pdMS_TO_TICKS(250));
+}
+while (Serial.available()) Serial.read();
+
+gate_driver_disable();
+Serial.println("[ADS] Gate drivers CLOSED.");
+
+
+while (Serial.available()) Serial.read();
+Serial.println("[ADS] Monitor stopped.");
+
     // =========================================================================
     // TEST 6 — ADS131M02 current read
     // =========================================================================
@@ -439,9 +464,6 @@ void setup() {
     bms_gpio_init();
     bms_spi_init();
 
-    // Wifi init
-    wifi_server_init();
-
     // Wake LTC chain immediately — before FSM or any other hardware access
     ltc_wakeup_sleep();
     ltc_wakeup_idle();
@@ -471,7 +493,7 @@ void setup() {
     // task_measure and task_daq would immediately fire since those tasks are
     // not spawned in this build. task_test feeds the hardware WDT directly.
     // task_balance and task_daq are also omitted.
-    xTaskCreatePinnedToCore(task_fsm,  "fsm",  8192, nullptr, 4, nullptr, 1);
+    //xTaskCreatePinnedToCore(task_fsm,  "fsm",  8192, nullptr, 4, nullptr, 1);
     xTaskCreatePinnedToCore(task_test, "test", 8192, nullptr, 3, nullptr, 1);
 
     Serial.println("[main] Tasks running — waiting for test output.");

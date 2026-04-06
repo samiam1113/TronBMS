@@ -77,8 +77,28 @@ static void buildCmd(uint16_t cmd, uint8_t out[4]) {
     out[3] =  crc       & 0xFF;
 }
 
+void ltc_debug_rdcfga_raw() {
+    uint8_t cmdBuf[4];
+    buildCmd(LTC_RDCFGA, cmdBuf);
+    uint8_t rxBuf[16] = {0};
+    hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
+    digitalWrite(HSPI_SS, LOW);
+    hspi->transfer(cmdBuf, 4);
+    hspi->transfer(rxBuf, 16);
+    digitalWrite(HSPI_SS, HIGH);
+    hspi->endTransaction();
+    Serial.printf("[dbg] Raw RDCFGA bytes:\n");
+    Serial.printf("  bytes 0-7:  ");
+    for(int i=0;i<8;i++) Serial.printf("%02X ",rxBuf[i]);
+    Serial.println();
+    Serial.printf("  bytes 8-15: ");
+    for(int i=8;i<16;i++) Serial.printf("%02X ",rxBuf[i]);
+    Serial.println();
+}
+
 // Broadcast a 4-byte command to all ICs — no data phase
 static void sendCmd(uint16_t cmd) {
+    ltc_wakeup_idle();  // add this
     uint8_t buf[4];
     buildCmd(cmd, buf);
     hspi->beginTransaction(SPISettings(LTC_SPI_CLK, MSBFIRST, SPI_MODE3));
@@ -90,6 +110,7 @@ static void sendCmd(uint16_t cmd) {
 
 // Read one register group from both ICs — returns ic0=IC1 data, ic1=IC2 data
 static bool readGroup(uint16_t cmd, uint8_t ic0[6], uint8_t ic1[6]) {
+    ltc_wakeup_idle();
     uint8_t cmdBuf[4];
     buildCmd(cmd, cmdBuf);
     uint8_t rxBuf[16] = {0};
@@ -123,6 +144,7 @@ static bool readGroup(uint16_t cmd, uint8_t ic0[6], uint8_t ic1[6]) {
 // Daisy-chain write: first bytes clocked in get pushed to the far end (IC1),
 // last bytes stay in the closest IC (IC2). So IC1's data goes first, IC2's last.
 static void writeGroup(uint16_t cmd, const uint8_t ic0_data[6], const uint8_t ic1_data[6]) {
+    ltc_wakeup_idle();
     uint8_t cmdBuf[4];
     buildCmd(cmd, cmdBuf);
 
@@ -272,9 +294,22 @@ bool ltc_start_adc_conversion(bool cells, bool gpio) {
 }
 
 bool ltc_read_voltages(measurement_data_t *meas) {
-  // Start cell ADC conversion and poll until complete (or timeout).
-  // Self-contained — callers never need to issue ADCV separately.
-  // ltc_start_adc_conversion() handles the PLADC busy-poll internally.
+  // Ensure REFON=1 on both ICs before conversion
+  LtcConfig cfg[2] = {};
+  for (int i = 0; i < 2; i++) {
+      cfg[i].refon  = true;
+      cfg[i].adcopt = false;
+      cfg[i].dcto   = 0x00;
+      cfg[i].dcc    = 0x0000;
+      cfg[i].vuv    = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
+      cfg[i].vov    = (uint16_t) (CELL_OV_RAW / 16u);
+      for (int g = 0; g < 5; g++) cfg[i].gpio_pulldown[g] = false;
+  }
+  ltc_write_config(cfg);
+  
+
+  delay(50);
+
   if (!ltc_start_adc_conversion(true, false)) {
       Serial.println("[ltc] ADCV conversion timeout");
       return false;
@@ -284,8 +319,12 @@ bool ltc_read_voltages(measurement_data_t *meas) {
   float    grpV[3];
   uint16_t grpR[3];
 
-  // ── Group A: IC1 cells 0–2, IC2 cells 0–2 ───────────────────────────────
+  // ── Group A: LTC C1,C2,C3 → cell 0,1,2 ─────────────────────────────────
   if (!readGroup(LTC_RDCVA, ic0, ic1)) return false;
+  Serial.printf("[dbg] RDCVA ic0: %02X %02X %02X %02X %02X %02X\n",
+      ic0[0],ic0[1],ic0[2],ic0[3],ic0[4],ic0[5]);
+  Serial.printf("[dbg] RDCVA ic1: %02X %02X %02X %02X %02X %02X\n",
+      ic1[0],ic1[1],ic1[2],ic1[3],ic1[4],ic1[5]);
   parseGroup(ic0, grpV, grpR);
   meas->cell_v[0][0]=grpV[0]; meas->cell_v[0][1]=grpV[1]; meas->cell_v[0][2]=grpV[2];
   meas->cell_raw[0][0]=grpR[0]; meas->cell_raw[0][1]=grpR[1]; meas->cell_raw[0][2]=grpR[2];
@@ -293,30 +332,32 @@ bool ltc_read_voltages(measurement_data_t *meas) {
   meas->cell_v[1][0]=grpV[0]; meas->cell_v[1][1]=grpV[1]; meas->cell_v[1][2]=grpV[2];
   meas->cell_raw[1][0]=grpR[0]; meas->cell_raw[1][1]=grpR[1]; meas->cell_raw[1][2]=grpR[2];
 
-  // ── Group B: IC1 cells 3–5, IC2 cells 3–5 ───────────────────────────────
+  // ── Group B: LTC C4,C5,C6 → cell 3,4,skip ──────────────────────────────
   if (!readGroup(LTC_RDCVB, ic0, ic1)) return false;
   parseGroup(ic0, grpV, grpR);
-  meas->cell_v[0][3]=grpV[0]; meas->cell_v[0][4]=grpV[1]; meas->cell_v[0][5]=grpV[2];
-  meas->cell_raw[0][3]=grpR[0]; meas->cell_raw[0][4]=grpR[1]; meas->cell_raw[0][5]=grpR[2];
+  meas->cell_v[0][3]=grpV[0]; meas->cell_v[0][4]=grpV[1];
+  meas->cell_raw[0][3]=grpR[0]; meas->cell_raw[0][4]=grpR[1];
   parseGroup(ic1, grpV, grpR);
-  meas->cell_v[1][3]=grpV[0]; meas->cell_v[1][4]=grpV[1]; meas->cell_v[1][5]=grpV[2];
-  meas->cell_raw[1][3]=grpR[0]; meas->cell_raw[1][4]=grpR[1]; meas->cell_raw[1][5]=grpR[2];
+  meas->cell_v[1][3]=grpV[0]; meas->cell_v[1][4]=grpV[1];
+  meas->cell_raw[1][3]=grpR[0]; meas->cell_raw[1][4]=grpR[1];
 
-  // ── Group C: IC1 cells 6–8, IC2 cells 6–8 ───────────────────────────────
+  // ── Group C: LTC C7,C8,C9 → cell 5,6,7 ─────────────────────────────────
   if (!readGroup(LTC_RDCVC, ic0, ic1)) return false;
   parseGroup(ic0, grpV, grpR);
-  meas->cell_v[0][6]=grpV[0]; meas->cell_v[0][7]=grpV[1]; meas->cell_v[0][8]=grpV[2];
-  meas->cell_raw[0][6]=grpR[0]; meas->cell_raw[0][7]=grpR[1]; meas->cell_raw[0][8]=grpR[2];
+  meas->cell_v[0][5]=grpV[0]; meas->cell_v[0][6]=grpV[1]; meas->cell_v[0][7]=grpV[2];
+  meas->cell_raw[0][5]=grpR[0]; meas->cell_raw[0][6]=grpR[1]; meas->cell_raw[0][7]=grpR[2];
   parseGroup(ic1, grpV, grpR);
-  meas->cell_v[1][6]=grpV[0]; meas->cell_v[1][7]=grpV[1]; meas->cell_v[1][8]=grpV[2];
-  meas->cell_raw[1][6]=grpR[0]; meas->cell_raw[1][7]=grpR[1]; meas->cell_raw[1][8]=grpR[2];
+  meas->cell_v[1][5]=grpV[0]; meas->cell_v[1][6]=grpV[1]; meas->cell_v[1][7]=grpV[2];
+  meas->cell_raw[1][5]=grpR[0]; meas->cell_raw[1][6]=grpR[1]; meas->cell_raw[1][7]=grpR[2];
 
-  // ── Group D: IC1 cell 9 only, IC2 cell 9 only (C11/C12 unused) ──────────
+  // ── Group D: LTC C10,C11 → cell 8,9 ────────────────────────────────────
   if (!readGroup(LTC_RDCVD, ic0, ic1)) return false;
   parseGroup(ic0, grpV, grpR);
-  meas->cell_v[0][9]=grpV[0]; meas->cell_raw[0][9]=grpR[0];
+  meas->cell_v[0][8]=grpV[0]; meas->cell_v[0][9]=grpV[1];
+  meas->cell_raw[0][8]=grpR[0]; meas->cell_raw[0][9]=grpR[1];
   parseGroup(ic1, grpV, grpR);
-  meas->cell_v[1][9]=grpV[0]; meas->cell_raw[1][9]=grpR[0];
+  meas->cell_v[1][8]=grpV[0]; meas->cell_v[1][9]=grpV[1];
+  meas->cell_raw[1][8]=grpR[0]; meas->cell_raw[1][9]=grpR[1];
 
   return true;
 }
