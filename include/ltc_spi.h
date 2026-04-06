@@ -82,3 +82,6 @@ void ltc_scope_loop(void);
 // ----------------------------------------------------------------------------
 void ltc_set_balance(bool cells[20]);
 void ltc_clear_balance(void);
+
+
+void ltc_debug_rdcfga_raw(void);

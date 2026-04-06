@@ -52,7 +52,7 @@
 
 #define ADS_EXPECTED_ID     0x2282  // ADS131M02-Q1 ID register
 #define ADS_GAIN1_VAL       0x0040  // CH1 gain=4 (bits[8:6]=010), CH0 gain=1
-#define ADS_CLOCK_VAL       0x030C  // OSR=4096, CH0+CH1 enabled
+#define ADS_CLOCK_VAL       0x030C  // OSR=1024, CH0+CH1 enabled, PWR=high-res
 
 // ── NTC thermistor (Steinhart-Hart) ───────────────────────────────────────────
 #define NTC_R25             10000.0f
@@ -78,6 +78,7 @@
 
 // ADS131M02 hardware reset
 #define ADS_RESET_PIN       21
+#define ADS_CLKIN_PIN       22
 
 // ── FreeRTOS event group bit definitions ──────────────────────────────────────
 // Kept here so bms_config.h is the single include for all compile-time consts.
