@@ -79,6 +79,7 @@
 // ADS131M02 hardware reset
 #define ADS_RESET_PIN       21
 #define ADS_CLKIN_PIN       22
+#define ADS_DRDY_PIN        32
 
 // ── FreeRTOS event group bit definitions ──────────────────────────────────────
 // Kept here so bms_config.h is the single include for all compile-time consts.
