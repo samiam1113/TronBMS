@@ -4,7 +4,9 @@
 // HOW IT WORKS:
 //   The ESP32 creates its own WiFi Access Point (no router needed).
 //   Connect your phone/laptop to the "TronBMS" network, then open a browser
-//   to http://192.168.4.1  — the GUI loads and auto-updates via WebSocket.
+//   to http://192.168.4.1  
+//   password is "bart1234"
+//   will need to add xTaskCreatePinnedToCore(task_wifi_broadcast, "wifi_bc", 4096, nullptr, 1, nullptr, 0) to main :)
 //
 
 #include "bms_wifi.h"
@@ -21,7 +23,7 @@
 
 // ── AP credentials ─────────────────────────────────────────────────────────
 #define WIFI_SSID       "TronBMS"
-#define WIFI_PASSWORD   "tronbms1"   // min 8 chars; set "" for open network
+#define WIFI_PASSWORD   "bart1234"   // min 8 chars; set "" for open network
 #define WIFI_CHANNEL    6
 #define WIFI_MAX_CONN   4
 
