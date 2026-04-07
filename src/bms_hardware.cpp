@@ -117,58 +117,37 @@ bool ads_configure() {
 
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
+  // Send entire configure sequence as one continuous 7-frame burst
+  // No gaps between frames — device sees uninterrupted SCLK stream
+
   // Frame 1: NULL — flush reset response
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
-
-  // Frame 2: WREG MODE (0x6040) — disable timeout only, keep 24-bit
-  // 0x0500: WLENGTH=01, TIMEOUT=0, RESET=1(clear)
-  adsXfer24(0x60, 0x40, 0x00);
-  adsXfer24(0x05, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-
-  // Frame 3: NULL — consume WREG MODE response
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-
-  // Frame 4: WREG GAIN1 (0x6080) — CH1 gain=4, CH0 gain=1
+  // Frame 2: WREG GAIN1 (0x6080), value 0x0040
   adsXfer24(0x60, 0x80, 0x00);
   adsXfer24(0x00, 0x40, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
-
-  // Frame 5: NULL — consume WREG GAIN1 response
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-
-  // Frame 6: RREG GAIN1 (0xA080) — verify
+  // Frame 3: RREG GAIN1 (0xA080)
   adsXfer24(0xA0, 0x80, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
-
-  // Frame 7: NULL — GAIN1 value in w1
+  // Frame 4: NULL — GAIN1 value in w1
   uint32_t gainRead = adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f4w2    = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f4w3    = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f4w4    = adsXfer24(0x00, 0x00, 0x00);
 
   vspi->endTransaction();
 
   uint16_t gainVal = (uint16_t)(gainRead >> 8);
+  Serial.printf("  [DBG] RREG GAIN1 frame: %06X %06X %06X %06X\n",
+    gainRead, f4w2, f4w3, f4w4);
   Serial.printf("  ADS GAIN1 reg: wrote 0x%04X, read 0x%04X %s\n",
     ADS_GAIN1_VAL, gainVal, gainVal == ADS_GAIN1_VAL ? "(OK)" : "(MISMATCH)");
-
-  // Accept default CLOCK (0x030E) — close enough to target (0x030C)
-  // Both specify OSR=1024, both channels enabled, high-resolution mode
-  Serial.println("  ADS CLOCK reg: using device default 0x030E (OK)");
 
   return (gainVal == ADS_GAIN1_VAL);
 }
