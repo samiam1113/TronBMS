@@ -102,8 +102,13 @@ void sleepADS131M02() {
   adsXfer32(0x00, 0x00, 0x00, 0x00);
   vspi->endTransaction();
 }
-/*
 bool ads_configure() {
+  // Re-initialise VSPI cleanly after LTC transactions on HSPI
+  vspi->end();
+  delay(10);
+  vspi->begin(VSPI_SCLK, VSPI_MISO, VSPI_MOSI);
+  delay(10);
+
   Serial.printf("[ADS] Resetting hardware: pin=%d\n", ADS_RESET_PIN);
   digitalWrite(ADS_RESET_PIN, LOW);
   delay(10);
@@ -111,57 +116,61 @@ bool ads_configure() {
 
   uint32_t t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY timeout"); return false; }
+    if (millis() - t0 > 100) {
+      Serial.println("  [ERR] DRDY timeout after reset");
+      return false;
+    }
   }
   Serial.println("  [ADS] DRDY high — device ready");
 
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
-  // Send entire configure sequence as one continuous 7-frame burst
-  // No gaps between frames — device sees uninterrupted SCLK stream
+  // Frame 1: NULL — flush reset response (FF22 in w1)
+  uint32_t f1w1 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f1w2 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f1w3 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f1w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 1: NULL — flush reset response
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
-  // Frame 2: WREG GAIN1 (0x6080), value 0x0040
+  // Frame 2: WREG GAIN1 (addr=0x04, n=0) = 0x6080
+  // ADS_GAIN1_VAL = 0x0040: CH1 gain=4, CH0 gain=1
   adsXfer24(0x60, 0x80, 0x00);
   adsXfer24(0x00, 0x40, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
-  // Frame 3: RREG GAIN1 (0xA080)
+
+  // Frame 3: NULL — consume WREG GAIN1 response
+  uint32_t f3w1 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f3w2 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f3w3 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f3w4 = adsXfer24(0x00, 0x00, 0x00);
+
+  // Frame 4: RREG GAIN1 (addr=0x04, n=0) = 0xA080
   adsXfer24(0xA0, 0x80, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
-  // Frame 4: NULL — GAIN1 value in w1
-  uint32_t gainRead = adsXfer24(0x00, 0x00, 0x00);
-  uint32_t f4w2    = adsXfer24(0x00, 0x00, 0x00);
-  uint32_t f4w3    = adsXfer24(0x00, 0x00, 0x00);
-  uint32_t f4w4    = adsXfer24(0x00, 0x00, 0x00);
+
+  // Frame 5: NULL — GAIN1 value in w1
+  uint32_t f5w1 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f5w2 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f5w3 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f5w4 = adsXfer24(0x00, 0x00, 0x00);
 
   vspi->endTransaction();
 
-  uint16_t gainVal = (uint16_t)(gainRead >> 8);
-  Serial.printf("  [DBG] RREG GAIN1 frame: %06X %06X %06X %06X\n",
-    gainRead, f4w2, f4w3, f4w4);
+  // All prints after endTransaction
+  Serial.printf("  [DBG] Reset flush:    %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
+  Serial.printf("  [DBG] WREG GAIN1 rsp: %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
+  Serial.printf("  [DBG] RREG GAIN1 rsp: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
+
+  uint16_t gainVal = (uint16_t)(f5w1 >> 8);
   Serial.printf("  ADS GAIN1 reg: wrote 0x%04X, read 0x%04X %s\n",
     ADS_GAIN1_VAL, gainVal, gainVal == ADS_GAIN1_VAL ? "(OK)" : "(MISMATCH)");
 
-  return (gainVal == ADS_GAIN1_VAL);
-}*/
+  // Accept default CLOCK (0x030E) — OSR=1024, both channels enabled, HR mode
+  Serial.println("  ADS CLOCK reg: using device default 0x030E (OK)");
 
-bool ads_configure() {
-  digitalWrite(ADS_RESET_PIN, LOW);
-  delay(10);
-  digitalWrite(ADS_RESET_PIN, HIGH);
-  uint32_t t0 = millis();
-  while (digitalRead(ADS_DRDY_PIN) == LOW) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY timeout"); return false; }
-  }
-  Serial.println("  [ADS] DRDY high — skipping config, testing raw reads");
-  return true;
+  return (gainVal == ADS_GAIN1_VAL);
 }
 
 // ============================================================================
