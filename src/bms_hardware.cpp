@@ -124,6 +124,9 @@ bool ads_configure() {
 
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
+  // Extra sync word — realign frame boundary by one word
+  adsXfer24(0x00, 0x00, 0x00);
+
   // Frame 1: NULL — flush reset response (FF22 in w1)
   uint32_t f1w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w2 = adsXfer24(0x00, 0x00, 0x00);
