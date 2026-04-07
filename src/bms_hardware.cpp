@@ -103,7 +103,6 @@ void sleepADS131M02() {
   vspi->endTransaction();
 }
 bool ads_configure() {
-  // Re-initialise VSPI cleanly after LTC transactions on HSPI
   vspi->end();
   delay(10);
   vspi->begin(VSPI_SCLK, VSPI_MISO, VSPI_MOSI);
@@ -150,24 +149,29 @@ bool ads_configure() {
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 5: NULL — GAIN1 value in w1
+  // Frame 5: NULL — consume RREG acknowledgement (w1=STATUS)
   uint32_t f5w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w4 = adsXfer24(0x00, 0x00, 0x00);
 
+  // Frame 6: NULL — GAIN1 register value in w1
+  uint32_t f6w1 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f6w2 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f6w3 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f6w4 = adsXfer24(0x00, 0x00, 0x00);
+
   vspi->endTransaction();
 
-  // All prints after endTransaction
   Serial.printf("  [DBG] Reset flush:    %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
   Serial.printf("  [DBG] WREG GAIN1 rsp: %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
-  Serial.printf("  [DBG] RREG GAIN1 rsp: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
+  Serial.printf("  [DBG] RREG GAIN1 ack: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
+  Serial.printf("  [DBG] RREG GAIN1 val: %06X %06X %06X %06X\n", f6w1, f6w2, f6w3, f6w4);
 
-  uint16_t gainVal = (uint16_t)(f5w1 >> 8);
+  uint16_t gainVal = (uint16_t)(f6w1 >> 8);
   Serial.printf("  ADS GAIN1 reg: wrote 0x%04X, read 0x%04X %s\n",
     ADS_GAIN1_VAL, gainVal, gainVal == ADS_GAIN1_VAL ? "(OK)" : "(MISMATCH)");
 
-  // Accept default CLOCK (0x030E) — OSR=1024, both channels enabled, HR mode
   Serial.println("  ADS CLOCK reg: using device default 0x030E (OK)");
 
   return (gainVal == ADS_GAIN1_VAL);
