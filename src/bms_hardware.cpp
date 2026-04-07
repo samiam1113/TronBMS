@@ -7,7 +7,7 @@
 SPIClass *vspi = NULL;
 SPIClass *hspi = NULL;
 
-static const int ADS_SPI_CLK = 4000000;
+static const int ADS_SPI_CLK = 500000;
 
 // ============================================================================
 // All ADS131M02 communication uses 32-bit words.
@@ -71,7 +71,7 @@ static uint32_t adsNullFrameRead24() {
 // ads_reset — SPI software reset command (does not touch the RESET pin).
 // ============================================================================
 void ads_reset() {
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
   // RESET command = 0x0011, MSB-aligned in 32-bit word
   adsXfer32(0x00, 0x11, 0x00, 0x00);
   adsXfer32(0x00, 0x00, 0x00, 0x00);
@@ -84,7 +84,7 @@ void ads_reset() {
 // wakeupADS131M02 / sleepADS131M02 — WAKEUP and STANDBY commands.
 // ============================================================================
 void wakeupADS131M02() {
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
   // WAKEUP = 0x0033
   adsXfer32(0x00, 0x33, 0x00, 0x00);
   adsXfer32(0x00, 0x00, 0x00, 0x00);
@@ -94,7 +94,7 @@ void wakeupADS131M02() {
 }
 
 void sleepADS131M02() {
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
   // STANDBY = 0x0022
   adsXfer32(0x00, 0x22, 0x00, 0x00);
   adsXfer32(0x00, 0x00, 0x00, 0x00);
@@ -123,7 +123,7 @@ bool ads_configure() {
   }
   Serial.println("  [ADS] DRDY high — device ready");
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   // Frame 1: NULL — flush reset response (FF22 in w1)
   uint32_t f1w1 = adsXfer24(0x00, 0x00, 0x00);
@@ -194,7 +194,7 @@ int32_t ads_read_raw() {
     }
   }
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   uint32_t status = adsXfer24(0x00, 0x00, 0x00);  // w1: STATUS
   uint32_t ch0raw = adsXfer24(0x00, 0x00, 0x00);  // w2: CH0
@@ -223,7 +223,7 @@ bool ads_checkid() {
     if (millis() - t0 > 10) { Serial.println("[ads] checkid DRDY timeout"); return false; }
   }
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   // Frame 1: RREG ID (addr=0x00, n=0) = 0xA000
   adsXfer24(0xA0, 0x00, 0x00);
