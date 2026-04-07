@@ -143,17 +143,27 @@ bool ads_configure() {
   digitalWrite(ADS_RESET_PIN, LOW);
   delay(10);
   digitalWrite(ADS_RESET_PIN, HIGH);
-  delay(1);
+
+  // Wait for DRDY to assert high — device ready for SPI
+  uint32_t t0 = millis();
+  while (digitalRead(ADS_DRDY_PIN) == LOW) {
+    if (millis() - t0 > 100) {
+      Serial.println("  [ERR] DRDY timeout after reset");
+      return false;
+    }
+  }
+  Serial.println("  [ADS] DRDY high — device ready");
 
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
-  // Frame 1: NULL — flush reset response
+  // Frame 1: NULL — flush reset response (FF22 in w1)
   uint32_t f1w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 2: WREG MODE (0x6040), value 0x0500
+  // Frame 2: WREG MODE (addr=0x02, n=0) = 0x6040
+  // Value 0x0500: WLENGTH=01(24-bit), TIMEOUT=0(disabled), RESET=1(clear)
   adsXfer24(0x60, 0x40, 0x00);
   adsXfer24(0x05, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
@@ -165,7 +175,7 @@ bool ads_configure() {
   uint32_t f3w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f3w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 4: RREG MODE (0xA040)
+  // Frame 4: RREG MODE (addr=0x02, n=0) = 0xA040
   adsXfer24(0xA0, 0x40, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
@@ -177,7 +187,8 @@ bool ads_configure() {
   uint32_t f5w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 6: WREG CLOCK (0x6060)
+  // Frame 6: WREG CLOCK (addr=0x03, n=0) = 0x6060
+  // ADS_CLOCK_VAL = 0x030C: CH1_EN=1, CH0_EN=1, OSR=1024, PWR=high-res
   adsXfer24(0x60, 0x60, 0x00);
   adsXfer24(0x03, 0x0C, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
@@ -189,7 +200,8 @@ bool ads_configure() {
   uint32_t f7w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f7w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 8: WREG GAIN1 (0x6080)
+  // Frame 8: WREG GAIN1 (addr=0x04, n=0) = 0x6080
+  // ADS_GAIN1_VAL = 0x0040: CH1 gain=4, CH0 gain=1
   adsXfer24(0x60, 0x80, 0x00);
   adsXfer24(0x00, 0x40, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
@@ -201,7 +213,7 @@ bool ads_configure() {
   uint32_t f9w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f9w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 10: RREG CLOCK (0xA060)
+  // Frame 10: RREG CLOCK (addr=0x03, n=0) = 0xA060
   adsXfer24(0xA0, 0x60, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
@@ -213,7 +225,7 @@ bool ads_configure() {
   uint32_t f11w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f11w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 12: RREG GAIN1 (0xA080)
+  // Frame 12: RREG GAIN1 (addr=0x04, n=0) = 0xA080
   adsXfer24(0xA0, 0x80, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
@@ -227,7 +239,7 @@ bool ads_configure() {
 
   vspi->endTransaction();
 
-  // All prints AFTER endTransaction — never print inside the transaction
+  // All prints after endTransaction
   Serial.printf("  [DBG] Reset flush:        %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
   Serial.printf("  [DBG] WREG MODE rsp:      %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
   Serial.printf("  [DBG] RREG MODE rsp:      %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
@@ -262,6 +274,15 @@ bool ads_configure() {
 // CH1 is current sense. Returns sign-extended 32-bit value.
 // ============================================================================
 int32_t ads_read_raw() {
+  // Wait for DRDY to go low — new conversion data ready
+  uint32_t t0 = millis();
+  while (digitalRead(ADS_DRDY_PIN) == HIGH) {
+    if (millis() - t0 > 10) {
+      Serial.println("[ads] DRDY timeout");
+      return 0;
+    }
+  }
+
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
   uint32_t status = adsXfer24(0x00, 0x00, 0x00);  // w1: STATUS
@@ -276,7 +297,6 @@ int32_t ads_read_raw() {
       (ch0raw >> 8) & 0xFFFFFF,
       (ch1raw >> 8) & 0xFFFFFF);
 
-  // Sign-extend 24-bit two's complement
   int32_t raw24 = (int32_t)((ch1raw >> 8) & 0xFFFFFF);
   if (raw24 & 0x800000) raw24 |= 0xFF000000;
   return raw24;
@@ -356,6 +376,7 @@ void bms_gpio_init() {
   pinMode(GATE_CHG_PIN,   OUTPUT);
   pinMode(ADS_RESET_PIN,  OUTPUT);
   pinMode(HSPI_SS,        OUTPUT);
+  pinMode(ADS_DRDY_PIN, INPUT);
 
   digitalWrite(ADS_RESET_PIN,  HIGH);  // active-low, keep deasserted
   digitalWrite(GATE_DSCHG_PIN, LOW);
