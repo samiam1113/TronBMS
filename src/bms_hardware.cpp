@@ -71,7 +71,7 @@ static uint32_t adsNullFrameRead24() {
 // ads_reset — SPI software reset command (does not touch the RESET pin).
 // ============================================================================
 void ads_reset() {
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
   // RESET command = 0x0011, MSB-aligned in 32-bit word
   adsXfer32(0x00, 0x11, 0x00, 0x00);
   adsXfer32(0x00, 0x00, 0x00, 0x00);
@@ -84,7 +84,7 @@ void ads_reset() {
 // wakeupADS131M02 / sleepADS131M02 — WAKEUP and STANDBY commands.
 // ============================================================================
 void wakeupADS131M02() {
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
   // WAKEUP = 0x0033
   adsXfer32(0x00, 0x33, 0x00, 0x00);
   adsXfer32(0x00, 0x00, 0x00, 0x00);
@@ -94,7 +94,7 @@ void wakeupADS131M02() {
 }
 
 void sleepADS131M02() {
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
   // STANDBY = 0x0022
   adsXfer32(0x00, 0x22, 0x00, 0x00);
   adsXfer32(0x00, 0x00, 0x00, 0x00);
@@ -108,7 +108,6 @@ bool ads_configure() {
   vspi->begin(VSPI_SCLK, VSPI_MISO, VSPI_MOSI);
   delay(10);
 
-  // Stop CLKIN before reset
   ledcWrite(0, 0);
   delay(1);
 
@@ -116,73 +115,52 @@ bool ads_configure() {
   digitalWrite(ADS_RESET_PIN, LOW);
   delay(10);
   digitalWrite(ADS_RESET_PIN, HIGH);
-
-  // Restart CLKIN
   ledcWrite(0, 1);
 
-  // Wait for DRDY high — device ready after reset
   uint32_t t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW) {
-    if (millis() - t0 > 100) {
-      Serial.println("  [ERR] DRDY timeout after reset");
-      return false;
-    }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY timeout"); return false; }
   }
   Serial.println("  [ADS] DRDY high — device ready");
 
-  // Debug: show DRDY state before waiting for low
   Serial.printf("  [DBG] DRDY pin state before wait: %d\n", digitalRead(ADS_DRDY_PIN));
 
-  // Wait for DRDY low — start of first conversion frame
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == HIGH) {
-    if (millis() - t0 > 100) {
-      Serial.println("  [ERR] DRDY never went low — timeout");
-      return false;
-    }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY never went low"); return false; }
   }
   Serial.println("  [ADS] DRDY low — frame sync acquired");
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
+  // Single transaction for entire configure sequence
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
-  // Frame 1: NULL — read and discard first conversion frame
+  // Frame 1: NULL — consume current conversion frame
   uint32_t f1w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  vspi->endTransaction();
-
-  Serial.printf("  [DBG] First frame:    %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
-
-  // Wait for next DRDY low
+  // Wait for next DRDY low inside transaction
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW)  { if (millis() - t0 > 10) break; }
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == HIGH) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY sync lost"); return false; }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY lost after frame 1"); vspi->endTransaction(); return false; }
   }
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
-
-  // Frame 2: WREG MODE (addr=0x02, n=0) = 0x6040
-  // 0x0100: RESET=0, WLENGTH=01(24-bit), TIMEOUT=0
+  // Frame 2: WREG MODE — clear RESET bit, disable timeout
   adsXfer24(0x60, 0x40, 0x00);
   adsXfer24(0x01, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
 
-  vspi->endTransaction();
-
   // Wait for next DRDY low
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW)  { if (millis() - t0 > 10) break; }
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == HIGH) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY sync lost"); return false; }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY lost after frame 2"); vspi->endTransaction(); return false; }
   }
-
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   // Frame 3: WREG GAIN1 — response to WREG MODE in w1
   uint32_t f3w1 = adsXfer24(0x60, 0x80, 0x00);
@@ -190,19 +168,13 @@ bool ads_configure() {
   uint32_t f3w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f3w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  vspi->endTransaction();
-
-  Serial.printf("  [DBG] WREG MODE rsp:  %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
-
   // Wait for next DRDY low
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW)  { if (millis() - t0 > 10) break; }
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == HIGH) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY sync lost"); return false; }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY lost after frame 3"); vspi->endTransaction(); return false; }
   }
-
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   // Frame 4: RREG GAIN1 — response to WREG GAIN1 in w1
   uint32_t f4w1 = adsXfer24(0xA0, 0x80, 0x00);
@@ -210,19 +182,13 @@ bool ads_configure() {
   uint32_t f4w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f4w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  vspi->endTransaction();
-
-  Serial.printf("  [DBG] WREG GAIN1 rsp: %06X %06X %06X %06X\n", f4w1, f4w2, f4w3, f4w4);
-
   // Wait for next DRDY low
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW)  { if (millis() - t0 > 10) break; }
   t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == HIGH) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY sync lost"); return false; }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY lost after frame 4"); vspi->endTransaction(); return false; }
   }
-
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   // Frame 5: NULL — GAIN1 register value in w1
   uint32_t f5w1 = adsXfer24(0x00, 0x00, 0x00);
@@ -232,6 +198,9 @@ bool ads_configure() {
 
   vspi->endTransaction();
 
+  Serial.printf("  [DBG] Frame 1:        %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
+  Serial.printf("  [DBG] WREG MODE rsp:  %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
+  Serial.printf("  [DBG] WREG GAIN1 rsp: %06X %06X %06X %06X\n", f4w1, f4w2, f4w3, f4w4);
   Serial.printf("  [DBG] RREG GAIN1 val: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
 
   uint16_t modeRsp = (uint16_t)(f3w1 >> 8);
@@ -247,7 +216,6 @@ bool ads_configure() {
 
   return (gainVal == ADS_GAIN1_VAL);
 }
-
 // ============================================================================
 // ads_read_raw — read one conversion frame from the ADS131M02.
 //
@@ -269,7 +237,7 @@ int32_t ads_read_raw() {
     }
   }
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
   uint32_t status = adsXfer24(0x00, 0x00, 0x00);  // w1: STATUS
   uint32_t ch0raw = adsXfer24(0x00, 0x00, 0x00);  // w2: CH0
@@ -298,7 +266,7 @@ bool ads_checkid() {
     if (millis() - t0 > 10) { Serial.println("[ads] checkid DRDY timeout"); return false; }
   }
 
-  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE1));
 
   // Frame 1: RREG ID (addr=0x00, n=0) = 0xA000
   adsXfer24(0xA0, 0x00, 0x00);
