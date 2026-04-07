@@ -119,7 +119,7 @@ bool ads_configure() {
 
   uint32_t t0 = millis();
   while (digitalRead(ADS_DRDY_PIN) == LOW) {
-    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY timeout"); return false; }
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY timeout after reset"); return false; }
   }
   Serial.println("  [ADS] DRDY high — device ready");
 
@@ -128,22 +128,37 @@ bool ads_configure() {
   while (digitalRead(ADS_DRDY_PIN) == HIGH) {
     if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY never went low"); return false; }
   }
-  Serial.println("  [ADS] DRDY low — sending all frames immediately");
+  Serial.println("  [ADS] DRDY low — frame sync acquired");
 
-  // Send entire sequence back to back — no gaps, beats 32ms timeout
   vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
-  // Frame 1: NULL — consume current frame
+  // Frame 1: NULL — consume current conversion frame
   uint32_t f1w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 2: WREG MODE — clear RESET, disable timeout
+  // Frame 2: WREG MODE (addr=0x02, n=0) = 0x6040
+  // 0x0100: RESET=0, WLENGTH=01(24-bit), TIMEOUT=0
   adsXfer24(0x60, 0x40, 0x00);
   adsXfer24(0x01, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
+
+  vspi->endTransaction();
+
+  Serial.printf("  [DBG] Frame 1:       %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
+
+  // Wait for DRDY to pulse after MODE write — ADC resynchronising
+  t0 = millis();
+  while (digitalRead(ADS_DRDY_PIN) == LOW)  { if (millis() - t0 > 50) break; }
+  t0 = millis();
+  while (digitalRead(ADS_DRDY_PIN) == HIGH) {
+    if (millis() - t0 > 200) { Serial.println("  [ERR] DRDY lost after WREG MODE"); return false; }
+  }
+  Serial.println("  [ADS] DRDY pulsed after MODE write");
+
+  vspi->beginTransaction(SPISettings(ADS_SPI_CLK, MSBFIRST, SPI_MODE0));
 
   // Frame 3: WREG GAIN1 — response to WREG MODE in w1
   uint32_t f3w1 = adsXfer24(0x60, 0x80, 0x00);
@@ -165,7 +180,6 @@ bool ads_configure() {
 
   vspi->endTransaction();
 
-  Serial.printf("  [DBG] Frame 1:        %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
   Serial.printf("  [DBG] WREG MODE rsp:  %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
   Serial.printf("  [DBG] WREG GAIN1 rsp: %06X %06X %06X %06X\n", f4w1, f4w2, f4w3, f4w4);
   Serial.printf("  [DBG] RREG GAIN1 val: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
