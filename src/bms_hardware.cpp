@@ -130,59 +130,74 @@ bool ads_configure() {
   uint32_t f1w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f1w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 2: WREG GAIN1 (addr=0x04, n=0) = 0x6080
-  adsXfer24(0x60, 0x80, 0x00);
-  adsXfer24(0x00, 0x40, 0x00);
+  // Frame 2: WREG MODE (addr=0x02, n=0) = 0x6040
+  // 0x0100: RESET=0(clear), WLENGTH=01(24-bit), TIMEOUT=0(disabled)
+  adsXfer24(0x60, 0x40, 0x00);
+  adsXfer24(0x01, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 3: NULL — consume WREG GAIN1 response
+  // Frame 3: NULL — consume WREG MODE response
   uint32_t f3w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f3w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f3w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f3w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 4: RREG STATUS (addr=0x01, n=0) = 0xA020
-  adsXfer24(0xA0, 0x20, 0x00);
-  adsXfer24(0x00, 0x00, 0x00);
+  // Frame 4: WREG GAIN1 (addr=0x04, n=0) = 0x6080
+  adsXfer24(0x60, 0x80, 0x00);
+  adsXfer24(0x00, 0x40, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 5: NULL — STATUS register value in w1
+  // Frame 5: NULL — consume WREG GAIN1 response
   uint32_t f5w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f5w4 = adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 6: RREG GAIN1 (addr=0x04, n=0) = 0xA080
-  adsXfer24(0xA0, 0x80, 0x00);
+  // Frame 6: RREG MODE (addr=0x02, n=0) = 0xA040
+  adsXfer24(0xA0, 0x40, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
   adsXfer24(0x00, 0x00, 0x00);
 
-  // Frame 7: NULL — GAIN1 value in w1
+  // Frame 7: NULL — MODE value in w1
   uint32_t f7w1 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f7w2 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f7w3 = adsXfer24(0x00, 0x00, 0x00);
   uint32_t f7w4 = adsXfer24(0x00, 0x00, 0x00);
 
+  // Frame 8: RREG GAIN1 (addr=0x04, n=0) = 0xA080
+  adsXfer24(0xA0, 0x80, 0x00);
+  adsXfer24(0x00, 0x00, 0x00);
+  adsXfer24(0x00, 0x00, 0x00);
+  adsXfer24(0x00, 0x00, 0x00);
+
+  // Frame 9: NULL — GAIN1 value in w1
+  uint32_t f9w1 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f9w2 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f9w3 = adsXfer24(0x00, 0x00, 0x00);
+  uint32_t f9w4 = adsXfer24(0x00, 0x00, 0x00);
+
   vspi->endTransaction();
 
-  Serial.printf("  [DBG] Reset flush:     %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
-  Serial.printf("  [DBG] WREG GAIN1 rsp:  %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
-  Serial.printf("  [DBG] RREG STATUS val: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
-  Serial.printf("  [DBG] RREG GAIN1 val:  %06X %06X %06X %06X\n", f7w1, f7w2, f7w3, f7w4);
+  Serial.printf("  [DBG] Reset flush:    %06X %06X %06X %06X\n", f1w1, f1w2, f1w3, f1w4);
+  Serial.printf("  [DBG] WREG MODE rsp:  %06X %06X %06X %06X\n", f3w1, f3w2, f3w3, f3w4);
+  Serial.printf("  [DBG] WREG GAIN1 rsp: %06X %06X %06X %06X\n", f5w1, f5w2, f5w3, f5w4);
+  Serial.printf("  [DBG] RREG MODE val:  %06X %06X %06X %06X\n", f7w1, f7w2, f7w3, f7w4);
+  Serial.printf("  [DBG] RREG GAIN1 val: %06X %06X %06X %06X\n", f9w1, f9w2, f9w3, f9w4);
 
-  uint16_t statusVal = (uint16_t)(f5w1 >> 8);
-  uint16_t gainVal   = (uint16_t)(f7w1 >> 8);
+  uint16_t modeVal = (uint16_t)(f7w1 >> 8);
+  uint16_t gainVal = (uint16_t)(f9w1 >> 8);
 
-  Serial.printf("  ADS STATUS reg: read 0x%04X (expect 0x0500)\n", statusVal);
-  Serial.printf("  ADS GAIN1  reg: wrote 0x%04X, read 0x%04X %s\n",
+  Serial.printf("  ADS MODE  reg: wrote 0x0100, read 0x%04X %s\n",
+    modeVal, modeVal == 0x0100 ? "(OK)" : "(MISMATCH)");
+  Serial.printf("  ADS GAIN1 reg: wrote 0x%04X, read 0x%04X %s\n",
     ADS_GAIN1_VAL, gainVal, gainVal == ADS_GAIN1_VAL ? "(OK)" : "(MISMATCH)");
 
   Serial.println("  ADS CLOCK reg: using device default 0x030E (OK)");
 
-  return (gainVal == ADS_GAIN1_VAL);
+  return (modeVal == 0x0100 && gainVal == ADS_GAIN1_VAL);
 }
 
 // ============================================================================
