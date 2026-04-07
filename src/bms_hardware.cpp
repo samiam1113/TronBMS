@@ -102,7 +102,7 @@ void sleepADS131M02() {
   adsXfer32(0x00, 0x00, 0x00, 0x00);
   vspi->endTransaction();
 }
-
+/*
 bool ads_configure() {
   Serial.printf("[ADS] Resetting hardware: pin=%d\n", ADS_RESET_PIN);
   digitalWrite(ADS_RESET_PIN, LOW);
@@ -150,7 +150,20 @@ bool ads_configure() {
     ADS_GAIN1_VAL, gainVal, gainVal == ADS_GAIN1_VAL ? "(OK)" : "(MISMATCH)");
 
   return (gainVal == ADS_GAIN1_VAL);
+}*/
+
+bool ads_configure() {
+  digitalWrite(ADS_RESET_PIN, LOW);
+  delay(10);
+  digitalWrite(ADS_RESET_PIN, HIGH);
+  uint32_t t0 = millis();
+  while (digitalRead(ADS_DRDY_PIN) == LOW) {
+    if (millis() - t0 > 100) { Serial.println("  [ERR] DRDY timeout"); return false; }
+  }
+  Serial.println("  [ADS] DRDY high — skipping config, testing raw reads");
+  return true;
 }
+
 // ============================================================================
 // ads_read_raw — read one conversion frame from the ADS131M02.
 //
