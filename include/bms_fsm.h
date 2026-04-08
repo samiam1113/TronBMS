@@ -82,6 +82,11 @@ struct BmsFsm {
     uint32_t last_activity_ms = 0;        // updated by task_measure on any current
     bool     chg_open         = true;     // true = CHG contactor open
     bool     dsg_open         = true;     // true = DSG contactor open
+bool        from_charging     = false;          // tracks whether we entered FAULT from CHARGING (vs NORMAL) so we can
+                                  // gate contactor re-close attempts until the user explicitly
+                                  // tries to start charging again. Prevents auto-retries on
+                                  // a charge fault that would just keep setting the fault bit
+                                  // and draining the battery with repeated contactor open/close.
 };
 
 // ----------------------------------------------------------------------------

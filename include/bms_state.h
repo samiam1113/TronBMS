@@ -8,4 +8,5 @@ enum class BmsState : uint8_t {
     BALANCE,
     SLEEP,
     FAULT,
+    CHARGING,
 };

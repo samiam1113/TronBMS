@@ -38,6 +38,8 @@
 
 // ── Cell balancing ────────────────────────────────────────────────────────────
 #define BAL_THRESHOLD_UV    200u    // Balance if max-min delta >= 2 mV (200 counts)
+#define CELL_IMBALANCE_THRESHOLD_V 0.050f;  // 50 mV imbalance threshold
+
 
 // ── ADS131M02-Q1 current sensing ──────────────────────────────────────────────
 // Shunt: 0.4 mΩ  |  PGA gain: 4  |  Vref: 1.2 V (internal)

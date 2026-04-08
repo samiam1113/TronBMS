@@ -104,6 +104,19 @@ static bool state_timeout(const BmsFsm &fsm, uint32_t ms) {
     return (millis() - fsm.state_entry_ms) >= ms;
 }
 
+static bool cells_need_charge_balance(const measurement_data_t &meas) {
+    float vmin = meas.cell_v[0][0];
+    float vmax = meas.cell_v[0][0];
+    for (int ic = 0; ic < TOTAL_IC; ic++) {
+        for (int c = 0; c < CELLS_PER_IC; c++) {
+            float v = meas.cell_v[ic][c];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+    }
+    return (vmax - vmin) >= CELL_IMBALANCE_THRESHOLD_V;
+}
+
 // ============================================================================
 // State handlers
 // ============================================================================
@@ -183,10 +196,18 @@ static void state_normal(BmsFsm &fsm) {
         fsm_set_state(fsm, BmsState::SLEEP);
         return;
     }
+    
+    const float amps = ads_read_current();
+    if (amps < -0.5f) {
+    fsm_set_state(fsm, BmsState::CHARGING);
+    return;
+    }
 
     if (!balance_satisfied(&meas)) {
         fsm_set_state(fsm, BmsState::BALANCE);
     }
+
+    
 }
 
 // ----------------------------------------------------------------------------
@@ -215,6 +236,17 @@ static void state_balance(BmsFsm &fsm) {
         fsm_set_state(fsm, BmsState::FAULT);
         return;
     }
+
+    if (fsm.from_charging && !cells_need_charge_balance(meas_snap)) {
+    fsm.from_charging = false;
+    const float amps = ads_read_current();
+    // CORRECT — still charging only if current is sufficiently negative
+    if (amps < -0.5f) {
+        fsm_set_state(fsm, BmsState::CHARGING);
+    } else {
+        fsm_set_state(fsm, BmsState::SLEEP);
+    }
+}
     // Completion (EVT_BALANCE_DONE) and fault exit are handled by
     // task_fsm's event group processing — no action needed here
 }
@@ -245,6 +277,41 @@ static void state_fault(BmsFsm &fsm) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// CHARGING — monitor for charge faults and balance condition
+// ----------------------------------------------------------------------------
+
+static void state_charging(BmsFsm &fsm) {
+    measurement_data_t meas_snap;
+    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        meas_snap = g_meas;
+        xSemaphoreGive(g_meas_mutex);
+    } else {
+        return;
+    }
+
+    contactors_update(fsm);
+
+    if (fsm.fault_reg != 0) {
+        fsm_set_state(fsm, BmsState::FAULT);
+        return;
+    }
+
+    // Negative current = charging. If it rises above -0.5 A, charger has stopped.
+    const float amps = ads_read_current();
+    if (amps > -0.5f) {
+        fsm_set_state(fsm, BmsState::SLEEP);
+        return;
+    }
+
+    // Cell spread >= 50 mV — pause charging and balance
+    if (cells_need_charge_balance(meas_snap)) {
+        fsm.from_charging = true;
+        contactor_open_chg(fsm);
+        fsm_set_state(fsm, BmsState::BALANCE);
+    }
+}
+
 // ============================================================================
 // State transition — entry actions run exactly once per state change
 // ============================================================================
@@ -264,6 +331,14 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
 
         case BmsState::NORMAL:
             fsm.last_activity_ms = millis();  // reset idle timer on every NORMAL entry
+            contactors_update(fsm);
+            break;
+
+        case BmsState::CHARGING:
+            fsm.from_charging = false;      // clear return flag on fresh entry
+            fsm.last_activity_ms = millis(); // reset idle timer — we are active
+            contactor_close_chg(fsm);       // ensure CHG gate is closed
+            // DSG gate follows normal fault logic
             contactors_update(fsm);
             break;
 
@@ -301,6 +376,8 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
                 fault_log_write(&g_fault_snapshot);
             }
             break;
+
+        
     }
 }
 
@@ -323,11 +400,12 @@ BmsState fsm_get_state(const BmsFsm &fsm) {
 
 void fsm_run(BmsFsm &fsm) {
     switch (fsm.state) {
-        case BmsState::INIT:    state_init(fsm);    break;
-        case BmsState::STARTUP: state_startup(fsm); break;
-        case BmsState::NORMAL:  state_normal(fsm);  break;
-        case BmsState::BALANCE: state_balance(fsm); break;
-        case BmsState::SLEEP:   state_sleep(fsm);   break;
-        case BmsState::FAULT:   state_fault(fsm);   break;
+        case BmsState::INIT:     state_init(fsm);    break;
+        case BmsState::STARTUP:  state_startup(fsm); break;
+        case BmsState::NORMAL:   state_normal(fsm);  break;
+        case BmsState::CHARGING: state_charging(fsm); break;
+        case BmsState::BALANCE:  state_balance(fsm); break;
+        case BmsState::SLEEP:    state_sleep(fsm);   break;
+        case BmsState::FAULT:    state_fault(fsm);   break;
     }
 }
