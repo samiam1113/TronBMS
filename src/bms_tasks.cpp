@@ -56,6 +56,7 @@ static void print_fault_reg(uint16_t reg) {
 }
 
 static void print_pack_summary(const measurement_data_t &meas, BmsState state) {
+    Serial.println(); 
     float vmin = meas.cell_v[0][0], vmax = meas.cell_v[0][0], vsum = 0.0f;
     int bal_count = 0;
     int min_ic = 0, min_c = 0, max_ic = 0, max_c = 0;
@@ -96,6 +97,7 @@ static void print_pack_summary(const measurement_data_t &meas, BmsState state) {
 }
 
 static void print_cell_detail(const measurement_data_t &meas) {
+    Serial.println(); 
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         Serial.printf("[cells] IC%d: ", ic + 1);
         for (int c = 0; c < CELLS_PER_IC; c++)
@@ -153,6 +155,7 @@ void task_fsm(void *pvParameters) {
         EventBits_t bits = xEventGroupGetBits(g_event_group);
 
         if (bits & EVT_FAULT_ANY) {
+            Serial.println(); 
             Serial.printf("[fsm] FAULT bits=0x%04lX  from state=%s\n",
                           (uint32_t)bits, state_name(fsm_get_state(g_fsm)));
             if (bits & EVT_FAULT_OV)         { fault_set(static_cast<uint16_t>(Fault::CELL_OV));    Serial.println("[fsm]  CELL_OV"); }
@@ -181,6 +184,7 @@ void task_fsm(void *pvParameters) {
 // State transition log + cell detail on change
         BmsState cur = fsm_get_state(g_fsm);
         if (cur != s_prev_state) {
+            Serial.println(); 
             Serial.printf("[fsm] STATE %s → %s  t=%lums\n",
                           state_name(s_prev_state), state_name(cur), millis());
             s_prev_state = cur;
@@ -208,7 +212,7 @@ void task_fsm(void *pvParameters) {
 // task_serial — serial command handler
 // ============================================================================
 void task_serial(void *pvParameters) {
-    Serial.println("[serial] Command handler ready. Commands: c=simulate charge");
+    Serial.println("[serial] Command handler ready. Commands: c=simulate charge  x=clear faults");
     for (;;) {
         if (Serial.available()) {
             char cmd = Serial.read();
@@ -228,6 +232,21 @@ void task_serial(void *pvParameters) {
                         Serial.printf("[serial] Cannot force CHARGING from state %s.\n",
                                       state_name(cur));
                     }
+                    break;
+                }
+                case 'x': {
+                    Serial.println("[serial] CMD: Clearing fault register.");
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+                    fault_clear(static_cast<uint16_t>(Fault::OT));
+                    fault_clear(static_cast<uint16_t>(Fault::OC_CHG));
+                    fault_clear(static_cast<uint16_t>(Fault::OC_DSG));
+                    fault_clear(static_cast<uint16_t>(Fault::SPI));
+                    fault_clear(static_cast<uint16_t>(Fault::ADS_ID));
+                    fault_clear(static_cast<uint16_t>(Fault::GATE));
+                    fault_clear(static_cast<uint16_t>(Fault::TASK_STALL));
+                    g_fsm.fault_reg = 0;
+                    Serial.printf("[serial] Fault register cleared: 0x%04X\n", fault_get());
                     break;
                 }
                 default:
@@ -301,12 +320,39 @@ void task_measure(void *pvParameters) {
             Serial.println("[meas] WARN: DAQ queue full — frame dropped.");
         }
 
-        if (meas_check_overvoltage(&meas))  { Serial.println("[meas] FAULT: OV");  xEventGroupSetBits(g_event_group, EVT_FAULT_OV); }
-        if (meas_check_undervoltage(&meas)) { Serial.println("[meas] FAULT: UV");  xEventGroupSetBits(g_event_group, EVT_FAULT_UV); }
-        if (meas_check_overcurrent(&meas))  { Serial.printf("[meas] FAULT: OC  I=%.2fA\n", meas.current_a); xEventGroupSetBits(g_event_group, EVT_FAULT_OC); }
+        // OV check — print each offending cell
+        bool ov = false;
+        for (int ic = 0; ic < TOTAL_IC; ic++)
+            for (int c = 0; c < CELLS_PER_IC; c++)
+                if (meas.cell_v[ic][c] >= CELL_OV_V) {
+                    Serial.printf("[meas] FAULT OV: IC%d-C%02d=%.4fV (limit=%.4fV)\n",
+                                  ic+1, c+1, meas.cell_v[ic][c], CELL_OV_V);
+                    ov = true;
+                }
+        if (ov) xEventGroupSetBits(g_event_group, EVT_FAULT_OV);
+
+        // UV check — print each offending cell
+        bool uv = false;
+        for (int ic = 0; ic < TOTAL_IC; ic++)
+            for (int c = 0; c < CELLS_PER_IC; c++)
+                if (meas.cell_v[ic][c] <= CELL_UV_V) {
+                    Serial.printf("[meas] FAULT UV: IC%d-C%02d=%.4fV (limit=%.4fV)\n",
+                                  ic+1, c+1, meas.cell_v[ic][c], CELL_UV_V);
+                    uv = true;
+                }
+        if (uv) xEventGroupSetBits(g_event_group, EVT_FAULT_UV);
+
+        // OC check
+        if (meas_check_overcurrent(&meas)) {
+            Serial.printf("[meas] FAULT OC: I=%.3fA\n", meas.current_a);
+            xEventGroupSetBits(g_event_group, EVT_FAULT_OC);
+        }
+
+        // OT check
         uint8_t ot_ch = 0;
         if (meas_check_overtemp(&meas, &ot_ch)) {
-            Serial.printf("[meas] FAULT: OT  sensor=%d  T=%.1f°C\n", ot_ch, meas.temps[ot_ch]);
+            Serial.printf("[meas] FAULT OT: sensor=%d  T=%.1f°C (limit=%d°C)\n",
+                          ot_ch, meas.temps[ot_ch], TEMP_CUTOFF_C);
             xEventGroupSetBits(g_event_group, EVT_FAULT_OT);
         }
 
@@ -355,6 +401,7 @@ void task_balance(void *pvParameters) {
         s_wdt_checkin_balance = millis();
 
         while (fsm_get_state(g_fsm) == BmsState::BALANCE) {
+        Serial.println(); 
         Serial.println("[bal] BALANCE session starting.");
         uint32_t session_start = millis();
         uint32_t iter = 0;
@@ -379,6 +426,7 @@ void task_balance(void *pvParameters) {
             static uint32_t s_last_bal_print_ms = 0;
                 if ((millis() - s_last_bal_print_ms) >= 5000) {
                     s_last_bal_print_ms = millis();
+                    Serial.println(); 
                     Serial.printf("[bal] iter=%lu  flagged=%d  elapsed=%lums\n",
                         iter, flagged, millis() - session_start);
                 }
@@ -414,6 +462,7 @@ void task_balance(void *pvParameters) {
 
             vTaskDelay(pdMS_TO_TICKS(BAL_REFRESH_MS));
         }
+        Serial.println(); 
         Serial.printf("[bal] Session ended  iters=%lu  duration=%lums\n",
                       iter, millis() - session_start);
         }
