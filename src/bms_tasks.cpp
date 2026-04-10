@@ -58,11 +58,12 @@ static void print_fault_reg(uint16_t reg) {
 static void print_pack_summary(const measurement_data_t &meas, BmsState state) {
     float vmin = meas.cell_v[0][0], vmax = meas.cell_v[0][0], vsum = 0.0f;
     int bal_count = 0;
+    int min_ic = 0, min_c = 0, max_ic = 0, max_c = 0;
     for (int ic = 0; ic < TOTAL_IC; ic++)
         for (int c = 0; c < CELLS_PER_IC; c++) {
             float v = meas.cell_v[ic][c];
-            if (v < vmin) vmin = v;
-            if (v > vmax) vmax = v;
+            if (v < vmin) { vmin = v; min_ic = ic; min_c = c; }
+            if (v > vmax) { vmax = v; max_ic = ic; max_c = c; }
             vsum += v;
             if (meas.balance_cells[ic][c]) bal_count++;
         }
@@ -72,9 +73,12 @@ static void print_pack_summary(const measurement_data_t &meas, BmsState state) {
         if (meas.temps[i] > -50.0f && meas.temps[i] > tmax) tmax = meas.temps[i];
 
     Serial.printf(
-        "[pack] %-8s  SoC=%5.1f%%  pack=%6.3fV  min=%6.4fV  max=%6.4fV"
+        "[pack] %-8s  SoC=%5.1f%%  pack=%6.3fV"
+        "  min=IC%d-C%02d:%6.4fV  max=IC%d-C%02d:%6.4fV"
         "  delta=%5.1fmV  I=%+7.3fA  bal=%d\n",
-        state_name(state), soc, vsum, vmin, vmax,
+        state_name(state), soc, vsum,
+        min_ic + 1, min_c + 1, vmin,
+        max_ic + 1, max_c + 1, vmax,
         (vmax - vmin) * 1000.0f, meas.current_a, bal_count);
 
     Serial.print("[pack] temps: ");
