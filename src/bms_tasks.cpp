@@ -493,9 +493,7 @@ void task_watchdog(void *pvParameters) {
                           now - s_wdt_checkin_daq);
             xEventGroupSetBits(g_event_group, EVT_FAULT_TASK_STALL);
         }
-        if (fsm_get_state(g_fsm) != BmsState::FAULT) {
-            esp_task_wdt_reset();
-        }
+        esp_task_wdt_reset();
 
         vTaskDelay(pdMS_TO_TICKS(WDT_FEED_PERIOD_MS));
     }
