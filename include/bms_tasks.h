@@ -51,4 +51,5 @@ void task_daq(void *pvParameters);
 // only when FSM is not in STATE_FAULT
 void task_watchdog(void *pvParameters);
 
+void task_serial(void *pvParameters);
 #endif

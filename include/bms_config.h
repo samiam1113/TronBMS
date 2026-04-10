@@ -38,22 +38,21 @@
 
 // ── Cell balancing ────────────────────────────────────────────────────────────
 #define BAL_THRESHOLD_UV    200u    // Balance if max-min delta >= 2 mV (200 counts)
-#define CELL_IMBALANCE_THRESHOLD_V 0.050f;  // 50 mV imbalance threshold
-
+#define CELL_IMBALANCE_THRESHOLD_V 0.001f;  // 50 mV imbalance threshold
 
 // ── ADS131M02-Q1 current sensing ──────────────────────────────────────────────
 // Shunt: 0.4 mΩ  |  PGA gain: 4  |  Vref: 1.2 V (internal)
 // Full-scale input = Vref / Gain = 1.2 / 4 = 0.300 V
 // Full-scale current = 0.300 V / SHUNT_OHMS
 // LSB (24-bit signed, 2^23 counts full-scale) = ADS_FULL_SCALE_A / 2^23
-#define ADS_GAIN            4
+#define ADS_GAIN            1
 #define ADS_VREF            1.2f
 #define SHUNT_OHMS          0.0004f
 #define ADS_FULL_SCALE_A    (ADS_VREF / ((float)ADS_GAIN * SHUNT_OHMS))  // 750 A
 #define ADS_COUNTS_TO_AMPS  (ADS_FULL_SCALE_A / 8388608.0f)              // per count
 
 #define ADS_EXPECTED_ID     0x2282  // ADS131M02-Q1 ID register
-#define ADS_GAIN1_VAL       0x0040  // CH1 gain=4 (bits[8:6]=010), CH0 gain=1
+#define ADS_GAIN1_VAL       0x0000  // CH1 gain=4 (bits[8:6]=010), CH0 gain=1
 #define ADS_CLOCK_VAL       0x030C  // OSR=1024, CH0+CH1 enabled, PWR=high-res
 
 // ── NTC thermistor (Steinhart-Hart) ───────────────────────────────────────────
