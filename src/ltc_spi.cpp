@@ -220,7 +220,7 @@ static void encodeConfig(const LtcConfig &cfg, uint8_t d[6]) {
     d[0] = cfg.adcopt ? 0x01 : 0x00;
     d[0] |= cfg.refon  ? 0x04 : 0x00;
     for (int i = 0; i < 5; i++) {
-        if (!cfg.gpio_pulldown[i]) d[0] |= (1 << (i + 3)); //1=OFF
+        if (cfg.gpio_pulldown[i]) d[0] |= (1 << (i + 3)); //1=OFF
     }
     // CFGR1: VUV[7:0]
     d[1] = cfg.vuv & 0xFF;
@@ -293,19 +293,36 @@ bool ltc_start_adc_conversion(bool cells, bool gpio) {
     return false; // Timeout
 }
 
+static void ltc_write_config_refon_only() {
+    LtcConfig cfg[2] = {};
+    if (ltc_read_config(cfg)) {
+        // Preserve DCC and GPIO bits — only force REFON=1
+        for (int i = 0; i < 2; i++) {
+            cfg[i].refon  = true;
+            cfg[i].adcopt = false;
+            cfg[i].dcto   = 0x01;
+            cfg[i].vuv    = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
+            cfg[i].vov    = (uint16_t) (CELL_OV_RAW / 16u);
+            // dcc and gpio_pulldown preserved from readback
+        }
+    } else {
+        // Readback failed — safe defaults, DCC cleared
+        for (int i = 0; i < 2; i++) {
+            cfg[i].refon  = true;
+            cfg[i].adcopt = false;
+            cfg[i].dcto   = 0x01;
+            cfg[i].dcc    = 0x0000;
+            cfg[i].vuv    = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
+            cfg[i].vov    = (uint16_t) (CELL_OV_RAW / 16u);
+            for (int g = 0; g < 5; g++) cfg[i].gpio_pulldown[g] = false;
+        }
+    }
+    ltc_write_config(cfg);
+}
+
 bool ltc_read_voltages(measurement_data_t *meas) {
   // Ensure REFON=1 on both ICs before conversion
-  LtcConfig cfg[2] = {};
-  for (int i = 0; i < 2; i++) {
-      cfg[i].refon  = true;
-      cfg[i].adcopt = false;
-      cfg[i].dcto   = 0x00;
-      cfg[i].dcc    = 0x0000;
-      cfg[i].vuv    = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
-      cfg[i].vov    = (uint16_t) (CELL_OV_RAW / 16u);
-      for (int g = 0; g < 5; g++) cfg[i].gpio_pulldown[g] = false;
-  }
-  ltc_write_config(cfg);
+  ltc_write_config_refon_only();
   
 
   delay(50);
@@ -321,10 +338,6 @@ bool ltc_read_voltages(measurement_data_t *meas) {
 
   // ── Group A: LTC C1,C2,C3 → cell 0,1,2 ─────────────────────────────────
   if (!readGroup(LTC_RDCVA, ic0, ic1)) return false;
-  Serial.printf("[dbg] RDCVA ic0: %02X %02X %02X %02X %02X %02X\n",
-      ic0[0],ic0[1],ic0[2],ic0[3],ic0[4],ic0[5]);
-  Serial.printf("[dbg] RDCVA ic1: %02X %02X %02X %02X %02X %02X\n",
-      ic1[0],ic1[1],ic1[2],ic1[3],ic1[4],ic1[5]);
   parseGroup(ic0, grpV, grpR);
   meas->cell_v[0][0]=grpV[0]; meas->cell_v[0][1]=grpV[1]; meas->cell_v[0][2]=grpV[2];
   meas->cell_raw[0][0]=grpR[0]; meas->cell_raw[0][1]=grpR[1]; meas->cell_raw[0][2]=grpR[2];
@@ -381,9 +394,22 @@ static float ntcToTemp(float vgpio, float vref2) {
 }
 
 bool ltc_read_temperatures(measurement_data_t *meas) {
-  // Start GPIO ADC conversion and poll until complete, consistent with
-  // ltc_read_voltages. Fixed delay(10) replaced — PLADC poll is reliable
-  // across all ADC modes and doesn't over-wait.
+    // Write config with all GPIO pull-downs disabled — must happen 
+    // immediately before ADAX with no delay
+    LtcConfig cfg[2] = {};
+    ltc_read_config(cfg);  // preserve DCC bits
+    for (int i = 0; i < 2; i++) {
+        cfg[i].refon  = true;
+        cfg[i].adcopt = false;
+        cfg[i].dcto   = 0x00;
+        cfg[i].vuv    = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
+        cfg[i].vov    = (uint16_t) (CELL_OV_RAW / 16u);
+        for (int g = 0; g < 5; g++) cfg[i].gpio_pulldown[g] = true; // pull-downs OFF
+        // dcc preserved from readback
+    }
+    ltc_write_config(cfg);
+    // NO delay here — start conversion immediately
+
   if (!ltc_start_adc_conversion(false, true)) {
       Serial.println("[ltc] ADAX conversion timeout");
       return false;
@@ -408,7 +434,7 @@ bool ltc_read_temperatures(measurement_data_t *meas) {
   float ic2_g4   = ((uint16_t)ic1[0] | ((uint16_t)ic1[1] << 8)) * 0.0001f;
   float ic2_g5   = ((uint16_t)ic1[2] | ((uint16_t)ic1[3] << 8)) * 0.0001f;
   float ic2_vref = ((uint16_t)ic1[4] | ((uint16_t)ic1[5] << 8)) * 0.0001f;
- 
+
   // measurement_data_t has temps[5] — map IC1 GPIO 1–5
   // IC2 temperatures are not stored (only 5 slots); extend if needed
   meas->temps[0] = ntcToTemp(ic1_g1, ic1_vref);

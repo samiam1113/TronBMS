@@ -52,8 +52,12 @@ static bool twai_transmit_frame(uint32_t id, const uint8_t *data, uint8_t dlc) {
 
     esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(5));
     if (err != ESP_OK) {
-        Serial.printf("[telem] TX failed id=0x%03X err=%s\n",
-                      id, esp_err_to_name(err));
+        static uint32_t s_last_can_err_ms = 0;
+        if ((millis() - s_last_can_err_ms) >= 5000) {
+        s_last_can_err_ms = millis();
+        Serial.printf("[telem] TX failed id=0x%03X err=%s (suppressed repeats)\n",
+                  id, esp_err_to_name(err));
+}
         return false;
     }
     return true;

@@ -40,7 +40,7 @@ static void build_safe_config(LtcConfig cfg[2],
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         cfg[ic].refon  = true;
         cfg[ic].adcopt = false;
-        cfg[ic].dcto   = 0x00;
+        cfg[ic].dcto   = 0x01;
         for (int g = 0; g < 5; g++) cfg[ic].gpio_pulldown[g] = gpio_pd[g];
         cfg[ic].vuv = (uint16_t)((CELL_UV_RAW / 16u) - 1u);
         cfg[ic].vov = (uint16_t) (CELL_OV_RAW / 16u);
@@ -67,11 +67,7 @@ void balance_compute_mask(measurement_data_t *meas) {
         for (int c = 0; c < CELLS_PER_IC; c++) {
             bool bal = (meas->cell_raw[ic][c] > threshold);
             meas->balance_cells[ic][c] = bal;
-            if (bal) {
-                Serial.printf("[bal] IC%d cell%d flagged: %u counts > min %u + %u\n",
-                              ic + 1, c + 1,
-                              meas->cell_raw[ic][c], min_raw, BAL_THRESHOLD_UV);
-            }
+            
         }
     }
 }
@@ -93,9 +89,6 @@ bool balance_satisfied(const measurement_data_t *meas) {
     }
 
     uint16_t delta = max_raw - min_raw;
-    Serial.printf("[bal] Delta: %u counts (%.1f mV) — %s\n",
-                  delta, delta * 0.1f,
-                  delta < BAL_THRESHOLD_UV ? "SATISFIED" : "balancing");
     return delta < BAL_THRESHOLD_UV;
 }
 
@@ -123,7 +116,6 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
                 dcc[ic] |= (uint16_t)(1u << cell_to_dcc_bit[c]);
             }
         }
-        Serial.printf("[bal] IC%d DCC mask: 0x%03X\n", ic + 1, dcc[ic]);
     }
 
     // Fix #8: read the current LTC config so we can preserve the GPIO
@@ -136,9 +128,16 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
         Serial.println("[bal] balance_apply: ltc_read_config failed — GPIO pull-downs set to false");
     }
 
-    LtcConfig cfg[TOTAL_IC];
+LtcConfig cfg[TOTAL_IC];
     build_safe_config(cfg, dcc[0], dcc[1], gpio_pd);
     ltc_write_config(cfg);
+
+    ltc_write_config(cfg);
+    uint32_t t1 = millis();
+    LtcConfig verify[TOTAL_IC];
+    if (ltc_read_config(verify)) {
+        uint32_t t2 = millis();
+    }
     return LTC_OK;
 }
 

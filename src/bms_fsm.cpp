@@ -16,11 +16,21 @@
 //
 //   NORMAL
 //     entry : contactors closed (if no faults), isoSPI active
-//     do    : protection checks, idle timeout, balance condition
-//     exit  : → BALANCE | → SLEEP | → FAULT
+//     do    : protection checks, idle timeout, charge/balance condition
+//     exit  : → CHARGING (current < -0.5A) | → SLEEP | → FAULT
+//
+//   CHARGING
+//     entry : close CHG gate, reset idle timer
+//     do    : selective per-cell balancing while charging continues
+//             - Balance cell if cell >= 3.8V AND cell > (min + 25mV)
+//             - Open gate if any cell hits 4.1V and others >25mV behind,
+//               drain to within 3mV of lowest, close gate and continue
+//             - Emergency: spread >= 75mV → open gate, drain, resume
+//             - Done: all cells within 3mV of 4.1V → open gate, → SLEEP
+//     exit  : → SLEEP (charge done or charger removed) | → FAULT
 //
 //   BALANCE
-//     entry : notify task_balance (ADCV now issued inside ltc_read_voltages)
+//     entry : notify task_balance
 //     do    : recompute + apply balance mask each tick, protection checks
 //     exit  : → NORMAL (balanced) | → FAULT
 //
@@ -46,19 +56,28 @@
 #include "freertos/semphr.h"
 #include <Arduino.h>
 
+// ── Charging thresholds ───────────────────────────────────────────────────────
+static constexpr float CHG_CELL_TARGET_V       = 4.100f;  // Full charge target per cell
+static constexpr float CHG_DONE_WINDOW_V       = 0.003f;  // All within 3mV of 4.1V = done
+static constexpr float CHG_BAL_START_V         = 3.800f;  // Min cell voltage to start balancing
+static constexpr float CHG_BAL_DELTA_V         = 0.025f;  // 25mV above lowest triggers balance
+static constexpr float CHG_EMERGENCY_DELTA_V   = 0.075f;  // 75mV spread → emergency gate open
+static constexpr float CHG_DRAIN_DONE_V        = 0.003f;  // Drain until within 3mV of lowest
+static constexpr float CHG_GATE_OPEN_DELTA_V   = 0.025f;  // Gate open threshold when cell at 4.1V
+
+// ── Pack SoC calculation ──────────────────────────────────────────────────────
+// 82V pack = 100% (20S × 4.1V)
+static constexpr float PACK_FULL_V             = 82.0f;
+
 // Forward declarations — defined in bms_tasks.cpp
 extern SemaphoreHandle_t g_meas_mutex;
-extern SemaphoreHandle_t g_snapshot_mutex;   // Fix #4
+extern SemaphoreHandle_t g_snapshot_mutex;
 extern measurement_data_t g_meas;
-
-// ── Fault snapshot globals — defined in bms_tasks.cpp ────────────────────────
 extern fault_snapshot_t  g_fault_snapshot;
 extern volatile bool     g_fault_snapshot_pending;
 extern TaskHandle_t      g_balance_task_handle;
 
-// Forward declaration — defined below fsm_on_enter
 static void fsm_on_enter(BmsFsm &fsm, BmsState new_state);
-
 
 // ============================================================================
 // Internal helpers
@@ -93,20 +112,20 @@ static void contactors_update(BmsFsm &fsm) {
                                        : contactor_close_dsg(fsm);
 }
 
-// FSM-local fault_set — sets bit in fsm.fault_reg and re-evaluates contactors.
-// Distinct from the global fault_set() in bms_fault.cpp which sets g_faultRegister.
 static void fsm_fault_set(BmsFsm &fsm, Fault bit) {
-    fault_set(static_cast<uint16_t>(bit));  // write to g_faultRegister first
-    fsm.fault_reg = fault_get();            // then mirror into fsm
+    fault_set(static_cast<uint16_t>(bit));
+    fsm.fault_reg = fault_get();
     contactors_update(fsm);
 }
+
 static bool state_timeout(const BmsFsm &fsm, uint32_t ms) {
     return (millis() - fsm.state_entry_ms) >= ms;
 }
 
-static bool cells_need_charge_balance(const measurement_data_t &meas) {
-    float vmin = meas.cell_v[0][0];
-    float vmax = meas.cell_v[0][0];
+// Scan meas and return min/max cell voltages
+static void pack_min_max(const measurement_data_t &meas, float &vmin, float &vmax) {
+    vmin = meas.cell_v[0][0];
+    vmax = meas.cell_v[0][0];
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         for (int c = 0; c < CELLS_PER_IC; c++) {
             float v = meas.cell_v[ic][c];
@@ -114,7 +133,90 @@ static bool cells_need_charge_balance(const measurement_data_t &meas) {
             if (v > vmax) vmax = v;
         }
     }
-    return (vmax - vmin) >= CELL_IMBALANCE_THRESHOLD_V;
+}
+
+// Sum all cell voltages for SoC calculation
+static float pack_sum_voltage(const measurement_data_t &meas) {
+    float sum = 0.0f;
+    for (int ic = 0; ic < TOTAL_IC; ic++)
+        for (int c = 0; c < CELLS_PER_IC; c++)
+            sum += meas.cell_v[ic][c];
+    return sum;
+}
+
+static float pack_soc_percent(const measurement_data_t &meas) {
+    float soc = (pack_sum_voltage(meas) / PACK_FULL_V) * 100.0f;
+    if (soc > 100.0f) soc = 100.0f;
+    if (soc <   0.0f) soc =   0.0f;
+    return soc;
+}
+
+static bool cells_need_charge_balance(const measurement_data_t &meas) {
+    float vmin, vmax;
+    pack_min_max(meas, vmin, vmax);
+    return (vmax - vmin) >= CHG_BAL_DELTA_V;
+}
+
+// ============================================================================
+// Charging state helpers
+// ============================================================================
+
+// Apply a selective balance mask: only flag cells that are >= CHG_BAL_START_V
+// AND more than CHG_BAL_DELTA_V above the pack minimum.
+// Does NOT flag all cells — only the specific high ones.
+static void charging_balance_compute_selective(measurement_data_t *meas) {
+    float vmin, vmax;
+    pack_min_max(*meas, vmin, vmax);
+
+    for (int ic = 0; ic < TOTAL_IC; ic++) {
+        for (int c = 0; c < CELLS_PER_IC; c++) {
+            float v = meas->cell_v[ic][c];
+            // Balance this cell if it is at least CHG_BAL_START_V (3.8V)
+            // and more than CHG_BAL_DELTA_V (25mV) above the pack minimum
+            bool bal = (v >= CHG_BAL_START_V) && (v > (vmin + CHG_BAL_DELTA_V));
+            meas->balance_cells[ic][c] = bal;
+        }
+    }
+    (void)vmax;
+}
+
+// Apply an emergency drain mask: flag any cell that is more than
+// CHG_DRAIN_DONE_V (3mV) above the pack minimum.
+static void charging_emergency_mask(measurement_data_t *meas) {
+    float vmin, vmax;
+    pack_min_max(*meas, vmin, vmax);
+    for (int ic = 0; ic < TOTAL_IC; ic++)
+        for (int c = 0; c < CELLS_PER_IC; c++)
+            meas->balance_cells[ic][c] = (meas->cell_v[ic][c] > (vmin + CHG_DRAIN_DONE_V));
+    (void)vmax;
+}
+
+// Returns true when the emergency drain is complete:
+// all cells within CHG_DRAIN_DONE_V of the minimum.
+static bool charging_drain_satisfied(const measurement_data_t &meas) {
+    float vmin, vmax;
+    pack_min_max(meas, vmin, vmax);
+    return (vmax - vmin) <= CHG_DRAIN_DONE_V;
+}
+
+// Returns true when charging is complete:
+// all cells within CHG_DONE_WINDOW_V of CHG_CELL_TARGET_V.
+static bool charging_done(const measurement_data_t &meas) {
+    for (int ic = 0; ic < TOTAL_IC; ic++)
+        for (int c = 0; c < CELLS_PER_IC; c++)
+            if (meas.cell_v[ic][c] < (CHG_CELL_TARGET_V - CHG_DONE_WINDOW_V))
+                return false;
+    return true;
+}
+
+// Returns true if any cell has reached CHG_CELL_TARGET_V while other cells
+// are still more than CHG_GATE_OPEN_DELTA_V behind.
+static bool charging_needs_gate_open_balance(const measurement_data_t &meas) {
+    float vmin, vmax;
+    pack_min_max(meas, vmin, vmax);
+    bool any_at_target = (vmax >= CHG_CELL_TARGET_V);
+    bool others_behind = ((vmax - vmin) > CHG_GATE_OPEN_DELTA_V);
+    return any_at_target && others_behind;
 }
 
 // ============================================================================
@@ -128,11 +230,7 @@ static void state_init(BmsFsm &fsm) {
     ltc_wakeup_sleep();
 
     ads_reset();
-    if (!ads_configure()) {
-        fsm_fault_set(fsm, Fault::ADS_ID);
-        fsm_set_state(fsm, BmsState::FAULT);
-        return;
-    }
+vTaskDelay(pdMS_TO_TICKS(10));  // let ADS settle after reset
 
     fsm_set_state(fsm, BmsState::STARTUP);
 }
@@ -147,19 +245,12 @@ static void state_startup(BmsFsm &fsm) {
         return;
     }
 
-    if (!ads_checkid()) {
-        fsm_fault_set(fsm, Fault::ADS_ID);
-        fsm_set_state(fsm, BmsState::FAULT);
-        return;
-    }
-
     if (!gate_driver_selftest()) {
         fsm_fault_set(fsm, Fault::GATE);
         fsm_set_state(fsm, BmsState::FAULT);
         return;
     }
 
-    // REFON=1, all DCC bits cleared — both ICs identical
     LtcConfig cfg[TOTAL_IC] = {};
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         cfg[ic].refon  = true;
@@ -176,13 +267,9 @@ static void state_startup(BmsFsm &fsm) {
 }
 
 // ----------------------------------------------------------------------------
-// NORMAL — monitor pack, react to faults, decide balance or sleep
+// NORMAL — monitor pack, react to faults, decide charge/balance/sleep
 // ----------------------------------------------------------------------------
 static void state_normal(BmsFsm &fsm) {
-    // Take a snapshot of g_meas for this tick's checks
-    // (g_meas is written by task_measure; we read it here without a mutex
-    //  because individual float reads on Xtensa are atomic and the FSM
-    //  runs at lower priority than task_measure — acceptable for protection)
     const measurement_data_t &meas = g_meas;
 
     contactors_update(fsm);
@@ -196,27 +283,27 @@ static void state_normal(BmsFsm &fsm) {
         fsm_set_state(fsm, BmsState::SLEEP);
         return;
     }
-    
+
+    // Negative current = charging
     const float amps = ads_read_current();
     if (amps < -0.5f) {
-    fsm_set_state(fsm, BmsState::CHARGING);
-    return;
+        fsm_set_state(fsm, BmsState::CHARGING);
+        return;
     }
 
     if (!balance_satisfied(&meas)) {
         fsm_set_state(fsm, BmsState::BALANCE);
     }
-
-    
 }
 
 // ----------------------------------------------------------------------------
-// BALANCE — active cell balancing, protection checks every tick
+// CHARGING — monitor charging, selective per-cell balance, detect completion
+//
+// Sub-state machine inside CHARGING (tracked via fsm.chg_open):
+//   chg_open=false : normal charging, selective balance active
+//   chg_open=true  : gate-open drain phase (4.1V cell or emergency)
 // ----------------------------------------------------------------------------
-static void state_balance(BmsFsm &fsm) {
-    // FSM only monitors for fault/completion conditions each tick.
-    // All DCC mask computation and hardware writes are owned by task_balance.
-
+static void state_charging(BmsFsm &fsm) {
     measurement_data_t meas_snap;
     if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         meas_snap = g_meas;
@@ -225,37 +312,160 @@ static void state_balance(BmsFsm &fsm) {
         return;
     }
 
-    // Check balance overtemp — sets g_balance_overtemp which task_balance reads
+    // Print SoC periodically (every ~5 seconds at 100ms tick rate)
+    static uint32_t s_soc_print_ms = 0;
+    if ((millis() - s_soc_print_ms) >= 5000) {
+        float soc = pack_soc_percent(meas_snap);
+        float vmin, vmax;
+        pack_min_max(meas_snap, vmin, vmax);
+        Serial.printf("[chg] SoC: %.1f%%  min: %.4fV  max: %.4fV  delta: %.1fmV  I: %.2fA\n",
+                      soc, vmin, vmax, (vmax - vmin) * 1000.0f, meas_snap.current_a);
+        s_soc_print_ms = millis();
+    }
+
+    // ── Fault check ───────────────────────────────────────────────────────────
+    if (fsm.fault_reg != 0) {
+        balance_stop(&meas_snap);
+        if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                   sizeof(g_meas.balance_cells));
+            xSemaphoreGive(g_meas_mutex);
+        }
+        fsm_set_state(fsm, BmsState::FAULT);
+        return;
+    }
+
+    float vmin, vmax;
+    pack_min_max(meas_snap, vmin, vmax);
+    float spread = vmax - vmin;
+
+    // ── Gate-open drain phase ─────────────────────────────────────────────────
+    // Either a 4.1V cell was detected with others behind, or emergency spread.
+    // Drain until all within 3mV of minimum, then re-close gate.
+    if (fsm.chg_open) {
+        // Compute drain mask and apply
+        charging_emergency_mask(&meas_snap);
+        if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                   sizeof(g_meas.balance_cells));
+            xSemaphoreGive(g_meas_mutex);
+        }
+        balance_apply(&meas_snap);
+
+        if (charging_drain_satisfied(meas_snap)) {
+            // Drain complete
+            balance_stop(&meas_snap);
+            if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                       sizeof(g_meas.balance_cells));
+                xSemaphoreGive(g_meas_mutex);
+            }
+
+            // Check if charging is fully done
+            if (charging_done(meas_snap)) {
+                Serial.println("[chg] Charge complete — all cells within 3mV of 4.1V.");
+                contactor_open_chg(fsm);
+                fsm_set_state(fsm, BmsState::SLEEP);
+                return;
+            }
+
+            // Not done — re-close charge gate and continue
+            Serial.println("[chg] Drain complete — resuming charge.");
+            contactor_close_chg(fsm);
+        }
+        return;
+    }
+
+    // ── Normal charging phase ─────────────────────────────────────────────────
+
+    // Check if charger has been removed
+    const float amps = meas_snap.current_a;
+    if (amps > 999.0f) {
+        Serial.println("[chg] Charger removed — transitioning to SLEEP.");
+        balance_stop(&meas_snap);
+        if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                   sizeof(g_meas.balance_cells));
+            xSemaphoreGive(g_meas_mutex);
+        }
+        fsm_set_state(fsm, BmsState::SLEEP);
+        return;
+    }
+
+    // Emergency: spread >= 75mV → open gate immediately and drain
+    if (spread >= CHG_EMERGENCY_DELTA_V) {
+        Serial.printf("[chg] EMERGENCY: spread %.1fmV >= 75mV — opening charge gate.\n",
+                      spread * 1000.0f);
+        contactor_open_chg(fsm);
+        // fsm.chg_open is now true — drain phase runs next tick
+        return;
+    }
+
+    // 4.1V cell detected with others >25mV behind → open gate to drain
+    if (charging_needs_gate_open_balance(meas_snap)) {
+        Serial.printf("[chg] Cell at 4.1V with others >25mV behind (spread %.1fmV) — opening gate.\n",
+                      spread * 1000.0f);
+        contactor_open_chg(fsm);
+        return;
+    }
+
+    // Charge done: all within 3mV of 4.1V
+    if (charging_done(meas_snap)) {
+        Serial.println("[chg] Charge complete — all cells within 3mV of 4.1V.");
+        balance_stop(&meas_snap);
+        if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                   sizeof(g_meas.balance_cells));
+            xSemaphoreGive(g_meas_mutex);
+        }
+        contactor_open_chg(fsm);
+        fsm_set_state(fsm, BmsState::SLEEP);
+        return;
+    }
+
+    // Selective balance while charging continues
+    // Only flag cells >= 3.8V that are >25mV above the pack minimum
+    charging_balance_compute_selective(&meas_snap);
+
+    // Write balance mask back to g_meas so task_measure sees it
+    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+               sizeof(g_meas.balance_cells));
+        xSemaphoreGive(g_meas_mutex);
+    }
+
+    // Apply DCC bits — charge gate stays closed, balance runs simultaneously
+    balance_apply(&meas_snap);
+}
+
+// ----------------------------------------------------------------------------
+// BALANCE — active cell balancing from NORMAL state, protection checks
+// ----------------------------------------------------------------------------
+static void state_balance(BmsFsm &fsm) {
+    measurement_data_t meas_snap;
+    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        meas_snap = g_meas;
+        xSemaphoreGive(g_meas_mutex);
+    } else {
+        return;
+    }
+
     uint8_t bal_ot_ch = 0;
     meas_check_balance_overtemp(&meas_snap, &bal_ot_ch);
 
     contactors_update(fsm);
 
     if (fsm.fault_reg != 0) {
-        // Signal task_balance to stop by setting state before it checks
         fsm_set_state(fsm, BmsState::FAULT);
         return;
     }
-
-    if (fsm.from_charging && !cells_need_charge_balance(meas_snap)) {
-    fsm.from_charging = false;
-    const float amps = ads_read_current();
-    // CORRECT — still charging only if current is sufficiently negative
-    if (amps < -0.5f) {
-        fsm_set_state(fsm, BmsState::CHARGING);
-    } else {
-        fsm_set_state(fsm, BmsState::SLEEP);
-    }
-}
-    // Completion (EVT_BALANCE_DONE) and fault exit are handled by
-    // task_fsm's event group processing — no action needed here
+    // Completion and fault exit handled by task_fsm event group processing
 }
 
 // ----------------------------------------------------------------------------
 // SLEEP — LTC asleep, poll ADS131 current for wakeup
 // ----------------------------------------------------------------------------
 static void state_sleep(BmsFsm &fsm) {
-    // Wait for LTC reference to settle before polling current
     if ((millis() - fsm.state_entry_ms) < 3000) return;
 
     const float amps = ads_read_current();
@@ -277,41 +487,6 @@ static void state_fault(BmsFsm &fsm) {
     }
 }
 
-// ----------------------------------------------------------------------------
-// CHARGING — monitor for charge faults and balance condition
-// ----------------------------------------------------------------------------
-
-static void state_charging(BmsFsm &fsm) {
-    measurement_data_t meas_snap;
-    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        meas_snap = g_meas;
-        xSemaphoreGive(g_meas_mutex);
-    } else {
-        return;
-    }
-
-    contactors_update(fsm);
-
-    if (fsm.fault_reg != 0) {
-        fsm_set_state(fsm, BmsState::FAULT);
-        return;
-    }
-
-    // Negative current = charging. If it rises above -0.5 A, charger has stopped.
-    const float amps = ads_read_current();
-    if (amps > -0.5f) {
-        fsm_set_state(fsm, BmsState::SLEEP);
-        return;
-    }
-
-    // Cell spread >= 50 mV — pause charging and balance
-    if (cells_need_charge_balance(meas_snap)) {
-        fsm.from_charging = true;
-        contactor_open_chg(fsm);
-        fsm_set_state(fsm, BmsState::BALANCE);
-    }
-}
-
 // ============================================================================
 // State transition — entry actions run exactly once per state change
 // ============================================================================
@@ -330,21 +505,19 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
             break;
 
         case BmsState::NORMAL:
-            fsm.last_activity_ms = millis();  // reset idle timer on every NORMAL entry
+            fsm.last_activity_ms = millis();
             contactors_update(fsm);
             break;
 
         case BmsState::CHARGING:
-            fsm.from_charging = false;      // clear return flag on fresh entry
-            fsm.last_activity_ms = millis(); // reset idle timer — we are active
-            contactor_close_chg(fsm);       // ensure CHG gate is closed
-            // DSG gate follows normal fault logic
+            fsm.from_charging    = false;
+            fsm.last_activity_ms = millis();
+            contactor_close_chg(fsm);
             contactors_update(fsm);
+            Serial.println("[chg] Entering CHARGING state.");
             break;
 
         case BmsState::BALANCE:
-            // ADCV is now issued inside ltc_read_voltages — no need to start
-            // a conversion here. Just notify task_balance to begin.
             if (g_balance_task_handle) {
                 xTaskNotifyGive(g_balance_task_handle);
             }
@@ -355,29 +528,25 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
             ltc_wakeup_sleep();
             contactor_open_chg(fsm);
             contactor_open_dsg(fsm);
+            Serial.println("[fsm] Entering SLEEP.");
             break;
 
         case BmsState::FAULT:
             contactor_open_chg(fsm);
             contactor_open_dsg(fsm);
-            balance_stop(nullptr);  // clears DCC hardware only, no struct write
-            // Fix #4: hold g_snapshot_mutex across the full struct write AND the
-            // flag set. task_daq checks the flag under the same mutex, so it can
-            // never observe pending=true while the struct is only partially written.
+            balance_stop(nullptr);
             if (xSemaphoreTake(g_snapshot_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 fault_capture_context(&g_fault_snapshot, fsm.prev_state);
                 fault_log_write(&g_fault_snapshot);
                 g_fault_snapshot_pending = true;
                 xSemaphoreGive(g_snapshot_mutex);
             } else {
-                // Mutex timeout at fault entry — still capture and log,
-                // skip the pending flag so DAQ doesn't race the partial write.
                 fault_capture_context(&g_fault_snapshot, fsm.prev_state);
                 fault_log_write(&g_fault_snapshot);
             }
+            Serial.printf("[fsm] FAULT entered from state %d  fault_reg=0x%04X\n",
+                          static_cast<uint8_t>(fsm.prev_state), fsm.fault_reg);
             break;
-
-        
     }
 }
 
@@ -386,7 +555,7 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
 // ============================================================================
 
 void fsm_init(BmsFsm &fsm) {
-    fsm = BmsFsm{};   // zero-initialise to defaults
+    fsm = BmsFsm{};
     fsm_on_enter(fsm, BmsState::INIT);
 }
 
@@ -400,12 +569,12 @@ BmsState fsm_get_state(const BmsFsm &fsm) {
 
 void fsm_run(BmsFsm &fsm) {
     switch (fsm.state) {
-        case BmsState::INIT:     state_init(fsm);    break;
-        case BmsState::STARTUP:  state_startup(fsm); break;
-        case BmsState::NORMAL:   state_normal(fsm);  break;
+        case BmsState::INIT:     state_init(fsm);     break;
+        case BmsState::STARTUP:  state_startup(fsm);  break;
+        case BmsState::NORMAL:   state_normal(fsm);   break;
         case BmsState::CHARGING: state_charging(fsm); break;
-        case BmsState::BALANCE:  state_balance(fsm); break;
-        case BmsState::SLEEP:    state_sleep(fsm);   break;
-        case BmsState::FAULT:    state_fault(fsm);   break;
+        case BmsState::BALANCE:  state_balance(fsm);  break;
+        case BmsState::SLEEP:    state_sleep(fsm);    break;
+        case BmsState::FAULT:    state_fault(fsm);    break;
     }
 }

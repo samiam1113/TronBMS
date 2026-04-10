@@ -26,7 +26,76 @@
 #include "bms_balance.h"
 #include "bms_telemetry.h"
 #include "bms_tasks.h"
+#include "bms_wifi.h"
 
+// ── State name lookup ─────────────────────────────────────────────────────────
+static const char *state_name(BmsState s) {
+    switch (s) {
+        case BmsState::INIT:     return "INIT";
+        case BmsState::STARTUP:  return "STARTUP";
+        case BmsState::NORMAL:   return "NORMAL";
+        case BmsState::CHARGING: return "CHARGING";
+        case BmsState::BALANCE:  return "BALANCE";
+        case BmsState::SLEEP:    return "SLEEP";
+        case BmsState::FAULT:    return "FAULT";
+        default:                 return "UNKNOWN";
+    }
+}
+
+static void print_fault_reg(uint16_t reg) {
+    if (reg == 0) { Serial.print("NONE"); return; }
+    if (reg & static_cast<uint16_t>(Fault::CELL_OV))    Serial.print("CELL_OV ");
+    if (reg & static_cast<uint16_t>(Fault::CELL_UV))    Serial.print("CELL_UV ");
+    if (reg & static_cast<uint16_t>(Fault::OT))         Serial.print("OT ");
+    if (reg & static_cast<uint16_t>(Fault::OC_CHG))     Serial.print("OC_CHG ");
+    if (reg & static_cast<uint16_t>(Fault::OC_DSG))     Serial.print("OC_DSG ");
+    if (reg & static_cast<uint16_t>(Fault::SPI))        Serial.print("SPI ");
+    if (reg & static_cast<uint16_t>(Fault::ADS_ID))     Serial.print("ADS_ID ");
+    if (reg & static_cast<uint16_t>(Fault::GATE))       Serial.print("GATE ");
+    if (reg & static_cast<uint16_t>(Fault::TASK_STALL)) Serial.print("TASK_STALL ");
+}
+
+static void print_pack_summary(const measurement_data_t &meas, BmsState state) {
+    float vmin = meas.cell_v[0][0], vmax = meas.cell_v[0][0], vsum = 0.0f;
+    int bal_count = 0;
+    for (int ic = 0; ic < TOTAL_IC; ic++)
+        for (int c = 0; c < CELLS_PER_IC; c++) {
+            float v = meas.cell_v[ic][c];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+            vsum += v;
+            if (meas.balance_cells[ic][c]) bal_count++;
+        }
+    float soc = constrain((vsum / 82.0f) * 100.0f, 0.0f, 100.0f);
+    float tmax = -99.0f;
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++)
+        if (meas.temps[i] > -50.0f && meas.temps[i] > tmax) tmax = meas.temps[i];
+
+    Serial.printf("[pack] %-8s  SoC=%5.1f%%  pack=%6.3fV  min=%6.4fV  max=%6.4fV"
+                  "  delta=%5.1fmV  I=%+7.3fA  Tmax=%5.1f°C  bal=%d  fault=",
+                  state_name(state), soc, vsum, vmin, vmax,
+                  (vmax - vmin) * 1000.0f, meas.current_a, tmax, bal_count);
+    print_fault_reg(fault_get());
+    Serial.println();
+}
+
+static void print_cell_detail(const measurement_data_t &meas) {
+    for (int ic = 0; ic < TOTAL_IC; ic++) {
+        Serial.printf("[cells] IC%d: ", ic + 1);
+        for (int c = 0; c < CELLS_PER_IC; c++)
+            Serial.printf("C%02d=%6.4fV%s  ", c + 1, meas.cell_v[ic][c],
+                          meas.balance_cells[ic][c] ? "[B]" : "   ");
+        Serial.println();
+    }
+    Serial.print("[temps] ");
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
+        if (meas.temps[i] < -50.0f) Serial.printf("S%d=OPEN  ", i);
+        else Serial.printf("S%d=%5.1f°C%s  ", i, meas.temps[i],
+                           meas.temps[i] >= TEMP_CUTOFF_C ? "[CUT]" :
+                           meas.temps[i] >= TEMP_WARN_C   ? "[WRN]" : "");
+    }
+    Serial.println();
+}
 
 // ── Shared RTOS primitives ────────────────────────────────────────────────────
 EventGroupHandle_t  g_event_group         = nullptr;
@@ -57,6 +126,9 @@ static volatile uint32_t s_wdt_checkin_daq     = 0;
 // task_fsm
 // ============================================================================
 void task_fsm(void *pvParameters) {
+    BmsState s_prev_state = BmsState::INIT;
+    uint32_t s_last_detail_ms = 0;
+    Serial.println("[fsm] task started.");
 
     for (;;) {
         // Fix #1: process event bits BEFORE fsm_run() so faults set by
@@ -65,28 +137,103 @@ void task_fsm(void *pvParameters) {
         EventBits_t bits = xEventGroupGetBits(g_event_group);
 
         if (bits & EVT_FAULT_ANY) {
-            if (bits & EVT_FAULT_OV)         fault_set(static_cast<uint16_t>(Fault::CELL_OV));
-            if (bits & EVT_FAULT_UV)         fault_set(static_cast<uint16_t>(Fault::CELL_UV));
-            if (bits & EVT_FAULT_OC)         fault_set(static_cast<uint16_t>(Fault::OC_DSG));
-            if (bits & EVT_FAULT_OT)         fault_set(static_cast<uint16_t>(Fault::OT));
-            if (bits & EVT_FAULT_LTC)        fault_set(static_cast<uint16_t>(Fault::SPI));
-            if (bits & EVT_FAULT_ADS)        fault_set(static_cast<uint16_t>(Fault::ADS_ID));  // Fix #3
-            if (bits & EVT_FAULT_BAL_OT)     fault_set(static_cast<uint16_t>(Fault::OT));
-            if (bits & EVT_FAULT_TASK_STALL) fault_set(static_cast<uint16_t>(Fault::TASK_STALL));
-
+            Serial.printf("[fsm] FAULT bits=0x%04lX  from state=%s\n",
+                          (uint32_t)bits, state_name(fsm_get_state(g_fsm)));
+            if (bits & EVT_FAULT_OV)         { fault_set(static_cast<uint16_t>(Fault::CELL_OV));    Serial.println("[fsm]  CELL_OV"); }
+            if (bits & EVT_FAULT_UV)         { fault_set(static_cast<uint16_t>(Fault::CELL_UV));    Serial.println("[fsm]  CELL_UV"); }
+            if (bits & EVT_FAULT_OC)         { fault_set(static_cast<uint16_t>(Fault::OC_DSG));     Serial.println("[fsm]  OC_DSG"); }
+            if (bits & EVT_FAULT_OT)         { fault_set(static_cast<uint16_t>(Fault::OT));         Serial.println("[fsm]  OT"); }
+            if (bits & EVT_FAULT_LTC)        { fault_set(static_cast<uint16_t>(Fault::SPI));        Serial.println("[fsm]  SPI"); }
+            if (bits & EVT_FAULT_ADS)        { fault_set(static_cast<uint16_t>(Fault::ADS_ID));     Serial.println("[fsm]  ADS_ID"); }
+            if (bits & EVT_FAULT_BAL_OT)     { fault_set(static_cast<uint16_t>(Fault::OT));         Serial.println("[fsm]  BAL_OT"); }
+            if (bits & EVT_FAULT_TASK_STALL) { fault_set(static_cast<uint16_t>(Fault::TASK_STALL)); Serial.println("[fsm]  TASK_STALL"); }
+            Serial.printf("[fsm] fault_reg=0x%04X  active: ", fault_get());
+            print_fault_reg(fault_get());
+            Serial.println();
             xEventGroupClearBits(g_event_group, EVT_FAULT_ANY);
             fsm_set_state(g_fsm, BmsState::FAULT);
         }
 
-        if (bits & EVT_BALANCE_DONE) {
+       if (bits & EVT_BALANCE_DONE) {
+            Serial.println("[fsm] EVT_BALANCE_DONE — returning to NORMAL.");
             xEventGroupClearBits(g_event_group, EVT_BALANCE_DONE);
             fsm_set_state(g_fsm, BmsState::NORMAL);
         }
 
         fsm_run(g_fsm);
 
+// State transition log + cell detail on change
+        BmsState cur = fsm_get_state(g_fsm);
+        if (cur != s_prev_state) {
+            Serial.printf("[fsm] STATE %s → %s  t=%lums\n",
+                          state_name(s_prev_state), state_name(cur), millis());
+            s_prev_state = cur;
+            if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                measurement_data_t snap = g_meas;
+                xSemaphoreGive(g_meas_mutex);
+                print_cell_detail(snap);
+            }
+        }
+        // Full cell detail every 10 seconds
+        if ((millis() - s_last_detail_ms) >= 5000) {
+            s_last_detail_ms = millis();
+            if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                measurement_data_t snap = g_meas;
+                xSemaphoreGive(g_meas_mutex);
+                print_cell_detail(snap);
+            }
+        }
+
         xEventGroupSetBits(g_event_group, EVT_MEASURE_START);
         vTaskDelay(pdMS_TO_TICKS(MEASURE_PERIOD_MS));
+    }
+}
+// ============================================================================
+// task_serial — serial command handler
+// ============================================================================
+void task_serial(void *pvParameters) {
+    Serial.println("[serial] Command handler ready. Commands: c=simulate charge");
+    for (;;) {
+        if (Serial.available()) {
+            char cmd = Serial.read();
+            while (Serial.available()) Serial.read();
+            switch (cmd) {
+                case 'c': {
+                    Serial.println("[serial] CMD: Simulating charge current — forcing CHARGING state.");
+                    BmsState cur = fsm_get_state(g_fsm);
+                    if (cur == BmsState::NORMAL || cur == BmsState::BALANCE) {
+                        if (cur == BmsState::BALANCE) {
+                            balance_stop(&g_meas);
+                            Serial.println("[serial] Balance stopped.");
+                        }
+                        fsm_set_state(g_fsm, BmsState::CHARGING);
+                        Serial.println("[serial] FSM forced to CHARGING.");
+                    } else {
+                        Serial.printf("[serial] Cannot force CHARGING from state %s.\n",
+                                      state_name(cur));
+                    }
+                    break;
+                }
+                default:
+                    Serial.printf("[serial] Unknown command '%c'. Commands: c=simulate charge\n", cmd);
+                    break;
+            }
+        }
+
+        // Stack high-water mark every 10 seconds — OUTSIDE the Serial.available() block
+        static uint32_t s_hwm_ms = 0;
+        if ((millis() - s_hwm_ms) >= 10000) {
+            s_hwm_ms = millis();
+            Serial.printf("[hwm] serial=%u  fsm=%u  meas=%u  bal=%u  daq=%u  wdt=%u\n",
+                uxTaskGetStackHighWaterMark(NULL),
+                uxTaskGetStackHighWaterMark(xTaskGetHandle("fsm")),
+                uxTaskGetStackHighWaterMark(xTaskGetHandle("meas")),
+                uxTaskGetStackHighWaterMark(xTaskGetHandle("bal")),
+                uxTaskGetStackHighWaterMark(xTaskGetHandle("daq")),
+                uxTaskGetStackHighWaterMark(xTaskGetHandle("wdt")));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -94,6 +241,10 @@ void task_fsm(void *pvParameters) {
 // task_measure
 // ============================================================================
 void task_measure(void *pvParameters) {
+    static uint32_t s_last_print_ms = 0;
+    static float    s_last_current  = 0.0f;
+    static BmsState s_last_state    = BmsState::INIT;
+    Serial.println("[meas] task started.");
     for (;;) {
         xEventGroupWaitBits(
             g_event_group,
@@ -116,7 +267,7 @@ void task_measure(void *pvParameters) {
 
         // Read all measurements into local meas struct
         if (!meas_cell_data(&meas)) {
-            // meas_cell_data sets the SPI fault bit internally
+            Serial.println("[meas] ERROR: SPI read failed.");
             xEventGroupSetBits(g_event_group, EVT_FAULT_LTC);
             continue;
         }
@@ -131,21 +282,17 @@ void task_measure(void *pvParameters) {
             measurement_data_t discard;
             xQueueReceive(g_meas_queue, &discard, 0);
             xQueueSend(g_meas_queue, &meas, 0);
+            Serial.println("[meas] WARN: DAQ queue full — frame dropped.");
         }
 
-        // ── Protection checks ─────────────────────────────────────────────────
-        if (meas_check_overvoltage(&meas))
-            xEventGroupSetBits(g_event_group, EVT_FAULT_OV);
-
-        if (meas_check_undervoltage(&meas))
-            xEventGroupSetBits(g_event_group, EVT_FAULT_UV);
-
-        if (meas_check_overcurrent(&meas))
-            xEventGroupSetBits(g_event_group, EVT_FAULT_OC);
-
+        if (meas_check_overvoltage(&meas))  { Serial.println("[meas] FAULT: OV");  xEventGroupSetBits(g_event_group, EVT_FAULT_OV); }
+        if (meas_check_undervoltage(&meas)) { Serial.println("[meas] FAULT: UV");  xEventGroupSetBits(g_event_group, EVT_FAULT_UV); }
+        if (meas_check_overcurrent(&meas))  { Serial.printf("[meas] FAULT: OC  I=%.2fA\n", meas.current_a); xEventGroupSetBits(g_event_group, EVT_FAULT_OC); }
         uint8_t ot_ch = 0;
-        if (meas_check_overtemp(&meas, &ot_ch))
+        if (meas_check_overtemp(&meas, &ot_ch)) {
+            Serial.printf("[meas] FAULT: OT  sensor=%d  T=%.1f°C\n", ot_ch, meas.temps[ot_ch]);
             xEventGroupSetBits(g_event_group, EVT_FAULT_OT);
+        }
 
         // ── Sleep idle timeout — reset activity timestamp on any real current ─
         // 0.5 A deadband filters ADC noise so a resting pack doesn't stay awake.
@@ -153,7 +300,22 @@ void task_measure(void *pvParameters) {
         if (meas.current_a > 0.5f || meas.current_a < -0.5f) {
             g_fsm.last_activity_ms = millis();
         }
+        // Current direction change
+        if ((s_last_current > -0.5f) && (meas.current_a < -0.5f))
+            Serial.printf("[meas] → CHARGING  I=%.3fA\n", meas.current_a);
+        if ((s_last_current < -0.5f) && (meas.current_a > -0.5f))
+            Serial.printf("[meas] → NOT CHARGING  I=%.3fA\n", meas.current_a);
+        if ((s_last_current < 0.5f) && (meas.current_a > 0.5f))
+            Serial.printf("[meas] → DISCHARGING  I=%.3fA\n", meas.current_a);
+        s_last_current = meas.current_a;
 
+        // Throttled pack summary every 1 second
+        BmsState cur_state = fsm_get_state(g_fsm);
+        if (cur_state != s_last_state || (millis() - s_last_print_ms) >= 5000) {
+            s_last_print_ms = millis();
+            s_last_state = cur_state;
+            print_pack_summary(meas, cur_state);
+        }
         s_wdt_checkin_measure = millis();
     }
 }
@@ -162,6 +324,7 @@ void task_measure(void *pvParameters) {
 // task_balance
 // ============================================================================
 void task_balance(void *pvParameters) {
+    Serial.println("[bal] task started — waiting for notify.");
     for (;;) {
         // Fix #2: block here with ulTaskNotifyTake so the task re-arms itself
         // for each BALANCE entry without ever calling vTaskSuspend.
@@ -176,9 +339,14 @@ void task_balance(void *pvParameters) {
         s_wdt_checkin_balance = millis();
 
         while (fsm_get_state(g_fsm) == BmsState::BALANCE) {
-            // Checkin at top of loop so every iteration — including the final
-            // one that calls break — is counted.
+        Serial.println("[bal] BALANCE session starting.");
+        uint32_t session_start = millis();
+        uint32_t iter = 0;
+        s_wdt_checkin_balance = millis();
+
+        while (fsm_get_state(g_fsm) == BmsState::BALANCE) {
             s_wdt_checkin_balance = millis();
+            iter++;
 
             measurement_data_t meas_snap = {};
             if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -186,8 +354,18 @@ void task_balance(void *pvParameters) {
                 xSemaphoreGive(g_meas_mutex);
             }
 
-            // Compute mask into meas_snap, then write back balance_cells to g_meas
             balance_compute_mask(&meas_snap);
+
+            int flagged = 0;
+            for (int ic = 0; ic < TOTAL_IC; ic++)
+                for (int c = 0; c < CELLS_PER_IC; c++)
+                    if (meas_snap.balance_cells[ic][c]) flagged++;
+            static uint32_t s_last_bal_print_ms = 0;
+                if ((millis() - s_last_bal_print_ms) >= 5000) {
+                    s_last_bal_print_ms = millis();
+                    Serial.printf("[bal] iter=%lu  flagged=%d  elapsed=%lums\n",
+                        iter, flagged, millis() - session_start);
+                }
 
             if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 memcpy(g_meas.balance_cells, meas_snap.balance_cells,
@@ -196,6 +374,7 @@ void task_balance(void *pvParameters) {
             }
 
             if (balance_apply(&meas_snap) != LTC_OK) {
+                Serial.println("[bal] ERROR: balance_apply() SPI fail.");
                 xEventGroupSetBits(g_event_group, EVT_FAULT_LTC);
                 balance_stop(&meas_snap);
                 break;
@@ -203,18 +382,24 @@ void task_balance(void *pvParameters) {
 
             uint8_t ot_ch = 0;
             if (meas_check_balance_overtemp(&meas_snap, &ot_ch)) {
+                Serial.printf("[bal] OVERTEMP sensor=%d — stopping.\n", ot_ch);
                 balance_stop(&meas_snap);
                 xEventGroupSetBits(g_event_group, EVT_FAULT_BAL_OT);
                 break;
             }
 
             if (balance_satisfied(&meas_snap)) {
+                Serial.printf("[bal] SATISFIED  iters=%lu  duration=%lums\n",
+                              iter, millis() - session_start);
                 balance_stop(&meas_snap);
                 xEventGroupSetBits(g_event_group, EVT_BALANCE_DONE);
                 break;
             }
 
             vTaskDelay(pdMS_TO_TICKS(BAL_REFRESH_MS));
+        }
+        Serial.printf("[bal] Session ended  iters=%lu  duration=%lums\n",
+                      iter, millis() - session_start);
         }
         // No vTaskSuspend here — task loops back to ulTaskNotifyTake and blocks.
     }
@@ -225,29 +410,35 @@ void task_balance(void *pvParameters) {
 // ============================================================================
 void task_daq(void *pvParameters) {
     telemetry_init();
+    uint32_t frame_count = 0;
+    Serial.println("[daq] task started — CAN active.");
 
     for (;;) {
         measurement_data_t meas = {};
-
         if (xQueueReceive(g_meas_queue, &meas, portMAX_DELAY) == pdTRUE) {
+            frame_count++;
+            BmsState state = fsm_get_state(g_fsm);
 
-            telemetry_send(&meas, fsm_get_state(g_fsm));
+            telemetry_send(&meas, state);
+            wifi_push_telemetry(&meas, state, fault_get());
 
-            // Fix #4: take snapshot mutex before checking the flag and reading
-            // the struct. The write side (fsm_on_enter FAULT) holds this same
-            // mutex across the struct write + flag set, so we can never observe
-            // the flag true while the struct is only partially written.
+            if (frame_count % 50 == 0)
+                Serial.printf("[daq] %lu frames  state=%s  fault=0x%04X\n",
+                              frame_count, state_name(state), fault_get());
+
             if (xSemaphoreTake(g_snapshot_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 if (g_fault_snapshot_pending) {
-                    fault_snapshot_t snap_local = g_fault_snapshot;  // copy under lock
+                    fault_snapshot_t snap_local = g_fault_snapshot;
                     g_fault_snapshot_pending = false;
                     xSemaphoreGive(g_snapshot_mutex);
-                    telemetry_send_fault(&snap_local);               // transmit outside lock
+                    Serial.printf("[daq] Fault snapshot tx: code=%d  state=%s\n",
+                                  static_cast<uint8_t>(snap_local.code),
+                                  state_name(snap_local.state_at_fault));
+                    telemetry_send_fault(&snap_local);
                 } else {
                     xSemaphoreGive(g_snapshot_mutex);
                 }
             }
-
             s_wdt_checkin_daq = millis();
         }
     }
@@ -270,22 +461,22 @@ void task_watchdog(void *pvParameters) {
         uint32_t now = millis();
 
         if ((now - s_wdt_checkin_measure) > (MEASURE_PERIOD_MS * 2)) {
-            Serial.println("[wdt] task_measure stall detected");
+            Serial.printf("[wdt] task_measure STALL  last=%lums ago\n",
+                          now - s_wdt_checkin_measure);
             xEventGroupSetBits(g_event_group, EVT_FAULT_TASK_STALL);
         }
-
         if (fsm_get_state(g_fsm) == BmsState::BALANCE) {
             if ((now - s_wdt_checkin_balance) > (BAL_REFRESH_MS * 2)) {
-                Serial.println("[wdt] task_balance stall detected");
+                Serial.printf("[wdt] task_balance STALL  last=%lums ago\n",
+                              now - s_wdt_checkin_balance);
                 xEventGroupSetBits(g_event_group, EVT_FAULT_TASK_STALL);
             }
         }
-
         if ((now - s_wdt_checkin_daq) > DAQ_TIMEOUT_MS) {
-            Serial.println("[wdt] task_daq stall detected");
+            Serial.printf("[wdt] task_daq STALL  last=%lums ago\n",
+                          now - s_wdt_checkin_daq);
             xEventGroupSetBits(g_event_group, EVT_FAULT_TASK_STALL);
         }
-
         if (fsm_get_state(g_fsm) != BmsState::FAULT) {
             esp_task_wdt_reset();
         }
