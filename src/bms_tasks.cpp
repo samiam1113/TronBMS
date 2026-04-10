@@ -71,10 +71,22 @@ static void print_pack_summary(const measurement_data_t &meas, BmsState state) {
     for (int i = 0; i < NUM_TEMP_SENSORS; i++)
         if (meas.temps[i] > -50.0f && meas.temps[i] > tmax) tmax = meas.temps[i];
 
-    Serial.printf("[pack] %-8s  SoC=%5.1f%%  pack=%6.3fV  min=%6.4fV  max=%6.4fV"
-                  "  delta=%5.1fmV  I=%+7.3fA  Tmax=%5.1f°C  bal=%d  fault=",
-                  state_name(state), soc, vsum, vmin, vmax,
-                  (vmax - vmin) * 1000.0f, meas.current_a, tmax, bal_count);
+    Serial.printf(
+        "[pack] %-8s  SoC=%5.1f%%  pack=%6.3fV  min=%6.4fV  max=%6.4fV"
+        "  delta=%5.1fmV  I=%+7.3fA  bal=%d\n",
+        state_name(state), soc, vsum, vmin, vmax,
+        (vmax - vmin) * 1000.0f, meas.current_a, bal_count);
+
+    Serial.print("[pack] temps: ");
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
+        if (meas.temps[i] < -50.0f)
+            Serial.printf("S%d=OPEN  ", i);
+        else
+            Serial.printf("S%d=%5.1f°C%s  ", i, meas.temps[i],
+                          meas.temps[i] >= TEMP_CUTOFF_C ? "[CUT]" :
+                          meas.temps[i] >= TEMP_WARN_C   ? "[WRN]" : "");
+    }
+    Serial.print("  fault=");
     print_fault_reg(fault_get());
     Serial.println();
 }
