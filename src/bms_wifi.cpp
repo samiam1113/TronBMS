@@ -20,6 +20,10 @@
 #include "bms_fault.h"
 #include "bms_state.h"
 #include "freertos/semphr.h"
+#include "bms_fault.h"
+#include "bms_fsm.h"
+extern BmsFsm g_fsm;
+
 
 // ── AP credentials ─────────────────────────────────────────────────────────
 #define WIFI_SSID       "TronBMS"
@@ -216,13 +220,21 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
       <span class="stat-key">Last Update</span>
       <span class="stat-value" id="val-time" style="font-size:11px;">—</span>
     </div>
+    
   </div>
 
   <!-- Active faults -->
-  <div class="card">
-    <div class="card-title">Faults</div>
-    <div id="fault-list"><span class="no-faults">No active faults</span></div>
-  </div>
+<div class="card">
+  <div class="card-title">Faults</div>
+  <div id="fault-list"><span class="no-faults">No active faults</span></div>
+  <button id="clear-btn" onclick="clearFault()"
+    style="margin-top:10px;width:100%;padding:6px;background:transparent;
+           border:1px solid var(--danger);color:var(--danger);
+           border-radius:4px;cursor:pointer;font-family:inherit;
+           font-size:11px;letter-spacing:2px;">
+    CLEAR FAULT
+  </button>
+</div>
 </main>
 
 <footer id="footer-ts">Waiting for data…</footer>
@@ -296,6 +308,11 @@ function fillColor(pct) {
   // green at high, amber at 30%, red below 10%
   if (pct > 0.30) return `hsl(${Math.round(lerp(40, 140, (pct - 0.30) / 0.70))}, 80%, 30%)`;
   return `hsl(${Math.round(lerp(0, 40, pct / 0.30))}, 80%, 25%)`;
+}
+
+function clearFault() {
+  fetch('/clear_fault', { method: 'POST' })
+    .then(r => { if (!r.ok) console.error('Clear failed'); });
 }
 
 function applyData(d) {
@@ -500,6 +517,19 @@ void wifi_server_init(void)
     s_server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
         req->send_P(200, "text/html", INDEX_HTML);
     });
+
+    s_server.on("/clear_fault", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fault_clear(static_cast<uint16_t>(FaultCode::OVERVOLTAGE));
+    fault_clear(static_cast<uint16_t>(FaultCode::UNDERVOLTAGE));
+    fault_clear(static_cast<uint16_t>(FaultCode::OVERCURRENT));
+    fault_clear(static_cast<uint16_t>(FaultCode::OVERTEMP));
+    fault_clear(static_cast<uint16_t>(FaultCode::BAL_OVERTEMP));
+    fault_clear(static_cast<uint16_t>(FaultCode::SPI_LTC));
+    fault_clear(static_cast<uint16_t>(FaultCode::SPI_ADS));
+    fault_clear(static_cast<uint16_t>(FaultCode::STARTUP));
+    fsm_set_state(g_fsm, BmsState::INIT);
+    req->send(200, "text/plain", "OK");
+});
 
     // ── HTTP: JSON REST endpoint (optional polling fallback) ──────────────
     s_server.on("/data", HTTP_GET, [](AsyncWebServerRequest *req) {
