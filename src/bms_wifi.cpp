@@ -58,14 +58,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
   /* ── Reset & base ── */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --bg:       #0b0f14;
-    --surface:  #131920;
+    --bg:       #171518;
+    --surface:  #2d2a2e;
     --border:   #1e2a38;
     --accent:   #00e5ff;
     --warn:     #ffb300;
     --danger:   #ff1744;
     --ok:       #00e676;
-    --muted:    #546e7a;
+    --muted:    #769aab;
     --text:     #cfd8dc;
     --text-dim: #546e7a;
     --radius:   6px;
@@ -129,9 +129,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
   .cell-label, .cell-volt { position: relative; z-index: 1; }
   .cell-label { font-size: 10px; color: var(--text-dim); }
   .cell-volt  { font-size: 15px; font-weight: bold; letter-spacing: 1px; }
-  .cell.ov { border-color: var(--danger) !important; }
-  .cell.uv { border-color: var(--warn) !important; }
-  .cell.bal { border-color: var(--accent) !important; }
+  .cell.ov { border-color: var(--danger) !important; border-width: 3px; }
+  .cell.uv { border-color: var(--warn) !important; border-width: 3px;}
+  .cell.bal { border-color: var(--accent) !important; border-width: 3px;}
 
   /* ── Stat rows ── */
   .stat-row { display: flex; justify-content: space-between; align-items: baseline;
