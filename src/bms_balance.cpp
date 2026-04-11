@@ -53,23 +53,52 @@ static void build_safe_config(LtcConfig cfg[2],
 // balance_compute_mask
 // Marks cells in meas->balance_cells that are above min + threshold.
 // ============================================================================
+// ── Locked balance target — set once per session, cleared on stop ─────────────
+static float s_bal_target_v[TOTAL_IC][CELLS_PER_IC] = {};
+static bool  s_bal_target_set = false;
+
 void balance_compute_mask(measurement_data_t *meas) {
-    // Find global minimum raw count
-    uint16_t min_raw = meas->cell_raw[0][0];
+    // Find global minimum
+    float min_v = meas->cell_v[0][0];
     for (int ic = 0; ic < TOTAL_IC; ic++)
         for (int c = 0; c < CELLS_PER_IC; c++)
-            if (meas->cell_raw[ic][c] < min_raw)
-                min_raw = meas->cell_raw[ic][c];
+            if (meas->cell_v[ic][c] < min_v) min_v = meas->cell_v[ic][c];
 
-    uint16_t threshold = min_raw + BAL_THRESHOLD_UV;
+    float trigger_threshold = min_v + (BAL_THRESHOLD_UV * 0.0001f);
+    float done_threshold    = min_v + 0.005f;  // 5mV above current minimum
 
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         for (int c = 0; c < CELLS_PER_IC; c++) {
-            bool bal = (meas->cell_raw[ic][c] > threshold);
-            meas->balance_cells[ic][c] = bal;
-            
+            float v = meas->cell_v[ic][c];
+
+            if (!s_bal_target_set) {
+                // First call this session — flag cells above trigger threshold
+                // and lock their individual targets at (min + 5mV)
+                if (v > trigger_threshold) {
+                    meas->balance_cells[ic][c] = true;
+                    s_bal_target_v[ic][c] = min_v + 0.005f;
+                } else {
+                    meas->balance_cells[ic][c] = false;
+                    s_bal_target_v[ic][c] = 0.0f;
+                }
+            } else {
+                // Subsequent calls — keep balancing until cell reaches its target
+                if (meas->balance_cells[ic][c]) {
+                    if (v <= s_bal_target_v[ic][c]) {
+                        // Target reached — stop this cell
+                        meas->balance_cells[ic][c] = false;
+                        Serial.printf("[bal] IC%d-C%02d reached target %.4fV — stopping\n",
+                                      ic+1, c+1, s_bal_target_v[ic][c]);
+                    }
+                    // else keep balancing — target not yet reached
+                } else {
+                    // Cell was already done — don't re-trigger until next session
+                }
+            }
         }
     }
+
+    s_bal_target_set = true;
 }
 
 // ============================================================================
@@ -77,19 +106,24 @@ void balance_compute_mask(measurement_data_t *meas) {
 // Returns true if max-min delta is within threshold.
 // ============================================================================
 bool balance_satisfied(const measurement_data_t *meas) {
-    uint16_t min_raw = meas->cell_raw[0][0];
-    uint16_t max_raw = meas->cell_raw[0][0];
+    // Satisfied when no cells are still flagged for balancing
+    for (int ic = 0; ic < TOTAL_IC; ic++)
+        for (int c = 0; c < CELLS_PER_IC; c++)
+            if (meas->balance_cells[ic][c]) return false;
 
-    for (int ic = 0; ic < TOTAL_IC; ic++) {
+    float min_v = meas->cell_v[0][0];
+    float max_v = meas->cell_v[0][0];
+    for (int ic = 0; ic < TOTAL_IC; ic++)
         for (int c = 0; c < CELLS_PER_IC; c++) {
-            uint16_t r = meas->cell_raw[ic][c];
-            if (r < min_raw) min_raw = r;
-            if (r > max_raw) max_raw = r;
+            if (meas->cell_v[ic][c] < min_v) min_v = meas->cell_v[ic][c];
+            if (meas->cell_v[ic][c] > max_v) max_v = meas->cell_v[ic][c];
         }
-    }
 
-    uint16_t delta = max_raw - min_raw;
-    return delta < BAL_THRESHOLD_UV;
+    float delta = max_v - min_v;
+    Serial.printf("[bal] Delta: %.1fmV — %s\n",
+                  delta * 1000.0f,
+                  delta < (BAL_THRESHOLD_UV * 0.0001f) ? "SATISFIED" : "balancing");
+    return delta < (BAL_THRESHOLD_UV * 0.0001f);
 }
 
 // ============================================================================
@@ -146,12 +180,14 @@ LtcConfig cfg[TOTAL_IC];
 // Clears balance_cells in meas and pushes zeroed DCC to hardware.
 // ============================================================================
 void balance_stop(measurement_data_t *meas) {
+    s_bal_target_set = false;
+    memset(s_bal_target_v, 0, sizeof(s_bal_target_v));
+
     if (meas) {
         for (int ic = 0; ic < TOTAL_IC; ic++)
             for (int c = 0; c < CELLS_PER_IC; c++)
                 meas->balance_cells[ic][c] = false;
     }
-
     // Fix #8: balance_stop is called when leaving BALANCE, entering FAULT,
     // or entering SLEEP. In all three cases the LTC is either going to sleep
     // or the FSM is faulted — temperature reads are not active, so passing
