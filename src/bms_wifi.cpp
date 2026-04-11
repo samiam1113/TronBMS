@@ -323,8 +323,11 @@ function applyData(d) {
   // Cells
   const voltages = d.cells;  // flat array length 20
   let minV = Infinity, maxV = -Infinity, packV = 0;
+  let minIdx = 0, maxIdx = 0;
   voltages.forEach((v, i) => {
     packV += v;
+    if (v < voltages[minIdx]) minIdx = i;
+    if (v > voltages[maxIdx]) maxIdx = i;
     if (v < minV) minV = v;
     if (v > maxV) maxV = v;
     const pct = voltToFill(v);
@@ -338,11 +341,25 @@ function applyData(d) {
     tile.classList.toggle('bal', d.balance && d.balance[i]);
     
   });
+
+  voltages.forEach((v, i) => {
+    const tile = document.getElementById(`cell-${i}`);
+    const hasFlag = tile.classList.contains('ov') ||
+                    tile.classList.contains('uv') ||
+                    tile.classList.contains('bal');
+    if (!hasFlag) {
+        if (i === maxIdx)      tile.style.borderColor = '#5613ff';
+        else if (i === minIdx) tile.style.borderColor = '#eb2fcb';
+        else                   tile.style.borderColor = '';
+    } else {
+        tile.style.borderColor = '';
+    }
+  });
   const avgV = packV / voltages.length;
   document.getElementById('val-avg-cell').textContent = avgV.toFixed(4) + ' V';
   document.getElementById('val-pack-v').textContent   = packV.toFixed(2) + ' V';
-  document.getElementById('val-min-cell').textContent = minV.toFixed(4) + ' V';
-  document.getElementById('val-max-cell').textContent = maxV.toFixed(4) + ' V';
+  document.getElementById('val-min-cell').textContent = minV.toFixed(4) + ' V  IC' + (Math.floor(minIdx / 10) + 1) + ' C' + (minIdx % 10 + 1);
+  document.getElementById('val-max-cell').textContent = maxV.toFixed(4) + ' V  IC' + (Math.floor(maxIdx / 10) + 1) + ' C' + (maxIdx % 10 + 1);
   document.getElementById('val-delta').textContent    = ((maxV - minV) * 1000).toFixed(1) + ' mV';
 
   // Current
