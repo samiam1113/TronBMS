@@ -210,11 +210,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
     </div>
     <div class="stat-row">
       <span class="stat-key">Min Cell</span>
-      <span class="stat-value" id="val-min-cell">—</span>
+      <span class="stat-value"><span id="val-min-cell">—</span> <span id="val-min-label" style="font-size:11px;color:#eb2fcb"></span></span>
     </div>
     <div class="stat-row">
       <span class="stat-key">Max Cell</span>
-      <span class="stat-value" id="val-max-cell">—</span>
+      <span class="stat-value"><span id="val-max-cell">—</span> <span id="val-max-label" style="font-size:11px;color:#5613ff"></span></span>
     </div>
     <div class="stat-row">
       <span class="stat-key">Delta</span>
@@ -358,8 +358,10 @@ function applyData(d) {
   const avgV = packV / voltages.length;
   document.getElementById('val-avg-cell').textContent = avgV.toFixed(4) + ' V';
   document.getElementById('val-pack-v').textContent   = packV.toFixed(2) + ' V';
-  document.getElementById('val-min-cell').textContent = minV.toFixed(4) + ' V  IC' + (Math.floor(minIdx / 10) + 1) + ' C' + (minIdx % 10 + 1);
-  document.getElementById('val-max-cell').textContent = maxV.toFixed(4) + ' V  IC' + (Math.floor(maxIdx / 10) + 1) + ' C' + (maxIdx % 10 + 1);
+  document.getElementById('val-min-cell').textContent = minV.toFixed(4) + ' V';
+  document.getElementById('val-min-label').textContent = 'IC' + (Math.floor(minIdx / 10) + 1) + ' C' + (minIdx % 10 + 1);
+  document.getElementById('val-max-cell').textContent = maxV.toFixed(4) + ' V';
+  document.getElementById('val-max-label').textContent = 'IC' + (Math.floor(maxIdx / 10) + 1) + ' C' + (maxIdx % 10 + 1);
   document.getElementById('val-delta').textContent    = ((maxV - minV) * 1000).toFixed(1) + ' mV';
 
   // Current
