@@ -65,34 +65,27 @@ void balance_compute_mask(measurement_data_t *meas) {
             if (meas->cell_v[ic][c] < min_v) min_v = meas->cell_v[ic][c];
 
     float trigger_threshold = min_v + (BAL_THRESHOLD_UV * 0.0001f);
-    float done_threshold    = min_v + 0.005f;  // 5mV above current minimum
 
     for (int ic = 0; ic < TOTAL_IC; ic++) {
         for (int c = 0; c < CELLS_PER_IC; c++) {
             float v = meas->cell_v[ic][c];
 
-            if (!s_bal_target_set) {
-                // First call this session — flag cells above trigger threshold
-                // and lock their individual targets at (min + 5mV)
-                if (v > trigger_threshold) {
-                    meas->balance_cells[ic][c] = true;
-                    s_bal_target_v[ic][c] = min_v + 0.005f;
-                } else {
+            if (meas->balance_cells[ic][c]) {
+                // Already balancing — check if target reached
+                if (v <= s_bal_target_v[ic][c]) {
                     meas->balance_cells[ic][c] = false;
                     s_bal_target_v[ic][c] = 0.0f;
+                    Serial.printf("[bal] IC%d-C%02d reached target %.4fV — stopping\n",
+                                  ic+1, c+1, v);
                 }
+                // else keep balancing
             } else {
-                // Subsequent calls — keep balancing until cell reaches its target
-                if (meas->balance_cells[ic][c]) {
-                    if (v <= s_bal_target_v[ic][c]) {
-                        // Target reached — stop this cell
-                        meas->balance_cells[ic][c] = false;
-                        Serial.printf("[bal] IC%d-C%02d reached target %.4fV — stopping\n",
-                                      ic+1, c+1, s_bal_target_v[ic][c]);
-                    }
-                    // else keep balancing — target not yet reached
-                } else {
-                    // Cell was already done — don't re-trigger until next session
+                // Not currently balancing — check if newly eligible
+                if (v > trigger_threshold) {
+                    meas->balance_cells[ic][c] = true;
+                    s_bal_target_v[ic][c] = min_v + 0.010f;
+                    Serial.printf("[bal] IC%d-C%02d newly flagged: %.4fV > min %.4fV + threshold, target=%.4fV\n",
+                                  ic+1, c+1, v, min_v, s_bal_target_v[ic][c]);
                 }
             }
         }
