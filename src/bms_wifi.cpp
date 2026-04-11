@@ -328,8 +328,7 @@ function applyData(d) {
     if (v < minV) minV = v;
     if (v > maxV) maxV = v;
     const pct = voltToFill(v);
-    const avgV = packV / voltages.length;
-    document.getElementById('val-avg-cell').textContent = avgV.toFixed(4) + ' V';
+    
     document.getElementById(`fill-${i}`).style.height    = `${(pct * 100).toFixed(1)}%`;
     document.getElementById(`fill-${i}`).style.background = fillColor(pct);
     document.getElementById(`volt-${i}`).textContent      = v.toFixed(4) + ' V';
@@ -339,7 +338,8 @@ function applyData(d) {
     tile.classList.toggle('bal', d.balance && d.balance[i]);
     
   });
-
+  const avgV = packV / voltages.length;
+  document.getElementById('val-avg-cell').textContent = avgV.toFixed(4) + ' V';
   document.getElementById('val-pack-v').textContent   = packV.toFixed(2) + ' V';
   document.getElementById('val-min-cell').textContent = minV.toFixed(4) + ' V';
   document.getElementById('val-max-cell').textContent = maxV.toFixed(4) + ' V';
