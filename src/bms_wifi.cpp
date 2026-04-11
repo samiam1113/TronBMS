@@ -60,14 +60,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
   :root {
     --bg:       #171518;
     --surface:  #2d2a2e;
-    --border:   #1e2a38;
+    --border:   #a6c7ed;
     --accent:   #00e5ff;
     --warn:     #ffb300;
     --danger:   #ff1744;
     --ok:       #00e676;
     --muted:    #769aab;
     --text:     #cfd8dc;
-    --text-dim: #546e7a;
+    --text-dim: #a3d5ec;
     --radius:   6px;
     --cell-h:   56px;
   }
@@ -205,6 +205,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
       <span class="stat-value" id="val-pack-v">—</span>
     </div>
     <div class="stat-row">
+      <span class="stat-key">Avg Cell</span>
+      <span class="stat-value" id="val-avg-cell">—</span>
+    </div>
+    <div class="stat-row">
       <span class="stat-key">Min Cell</span>
       <span class="stat-value" id="val-min-cell">—</span>
     </div>
@@ -324,6 +328,8 @@ function applyData(d) {
     if (v < minV) minV = v;
     if (v > maxV) maxV = v;
     const pct = voltToFill(v);
+    const avgV = packV / voltages.length;
+    document.getElementById('val-avg-cell').textContent = avgV.toFixed(4) + ' V';
     document.getElementById(`fill-${i}`).style.height    = `${(pct * 100).toFixed(1)}%`;
     document.getElementById(`fill-${i}`).style.background = fillColor(pct);
     document.getElementById(`volt-${i}`).textContent      = v.toFixed(4) + ' V';
@@ -331,6 +337,7 @@ function applyData(d) {
     tile.classList.toggle('ov', v >= CELL_OV);
     tile.classList.toggle('uv', v > 0.1 && v <= CELL_UV);
     tile.classList.toggle('bal', d.balance && d.balance[i]);
+    
   });
 
   document.getElementById('val-pack-v').textContent   = packV.toFixed(2) + ' V';
