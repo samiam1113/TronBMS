@@ -545,12 +545,14 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
             contactors_update(fsm);
             break;
 
-        case BmsState::CHARGING:
+                case BmsState::CHARGING:
             fsm.from_charging    = false;
             fsm.last_activity_ms = millis();
             contactor_close_chg(fsm);
-            contactors_update(fsm);
-            Serial.println("[chg] Entering CHARGING state.");
+            contactor_close_dsg(fsm);
+            Serial.println("[chg] Entering CHARGING state — CHG and DSG gates closed.");
+            Serial.printf("[chg] GATE_CHG_PIN=%d  GATE_DSCHG_PIN=%d  both HIGH.\n",
+                          GATE_CHG_PIN, GATE_DSCHG_PIN);
             break;
 
         case BmsState::BALANCE:
