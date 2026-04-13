@@ -380,7 +380,7 @@ static void state_charging(BmsFsm &fsm) {
 
     // Check if charger has been removed
     const float amps = meas_snap.current_a;
-    if (amps > 999.0f) {
+    if (amps > -0.5f) {
         Serial.println("[chg] Charger removed — transitioning to SLEEP.");
         balance_stop(&meas_snap);
         if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
