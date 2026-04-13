@@ -284,13 +284,6 @@ static void state_normal(BmsFsm &fsm) {
         return;
     }
 
-    // Negative current = charging
-    const float amps = ads_read_current();
-    if (amps < -0.5f) {
-        fsm_set_state(fsm, BmsState::CHARGING);
-        return;
-    }
-
     if (!balance_satisfied(&meas)) {
         fsm_set_state(fsm, BmsState::BALANCE);
     }
@@ -380,7 +373,7 @@ static void state_charging(BmsFsm &fsm) {
 
     // Check if charger has been removed
     const float amps = meas_snap.current_a;
-    if (amps > -0.5f) {
+    if (amps > 999.0f) {
         Serial.println("[chg] Charger removed — transitioning to SLEEP.");
         balance_stop(&meas_snap);
         if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -487,6 +480,49 @@ static void state_fault(BmsFsm &fsm) {
     }
 }
 
+static void state_drive(BmsFsm &fsm) {
+    measurement_data_t meas_snap;
+    if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        meas_snap = g_meas;
+        xSemaphoreGive(g_meas_mutex);
+    } else return;
+
+    contactors_update(fsm);
+
+    if (fsm.fault_reg != 0) {
+        fsm_set_state(fsm, BmsState::FAULT);
+        return;
+    }
+
+    // Return to NORMAL when no discharge current
+    if (meas_snap.current_a < 0.5f) {
+        fsm_set_state(fsm, BmsState::NORMAL);
+        return;
+    }
+
+    // Update activity timestamp
+    fsm.last_activity_ms = millis();
+
+    // Periodic status
+    static uint32_t s_drive_print_ms = 0;
+    if ((millis() - s_drive_print_ms) >= 5000) {
+        s_drive_print_ms = millis();
+        float vmin, vmax;
+        float vsum = 0.0f;
+        vmin = vmax = meas_snap.cell_v[0][0];
+        for (int ic = 0; ic < TOTAL_IC; ic++)
+            for (int c = 0; c < CELLS_PER_IC; c++) {
+                float v = meas_snap.cell_v[ic][c];
+                if (v < vmin) vmin = v;
+                if (v > vmax) vmax = v;
+                vsum += v;
+            }
+        float soc = constrain((vsum / 82.0f) * 100.0f, 0.0f, 100.0f);
+        Serial.printf("[drive] SoC=%5.1f%%  pack=%.3fV  min=%.4fV  max=%.4fV  delta=%.1fmV  I=%.2fA\n",
+                      soc, vsum, vmin, vmax, (vmax-vmin)*1000.0f, meas_snap.current_a);
+    }
+}
+
 // ============================================================================
 // State transition — entry actions run exactly once per state change
 // ============================================================================
@@ -547,6 +583,12 @@ static void fsm_on_enter(BmsFsm &fsm, BmsState new_state) {
             Serial.printf("[fsm] FAULT entered from state %d  fault_reg=0x%04X\n",
                           static_cast<uint8_t>(fsm.prev_state), fsm.fault_reg);
             break;
+        case BmsState::DRIVE:
+            contactor_close_dsg(fsm);
+            contactors_update(fsm);
+            fsm.last_activity_ms = millis();
+            Serial.println("[fsm] Entering DRIVE state — DSG gate closed.");
+            break;
     }
 }
 
@@ -576,5 +618,6 @@ void fsm_run(BmsFsm &fsm) {
         case BmsState::BALANCE:  state_balance(fsm);  break;
         case BmsState::SLEEP:    state_sleep(fsm);    break;
         case BmsState::FAULT:    state_fault(fsm);    break;
+        case BmsState::DRIVE:    state_drive(fsm);    break;
     }
 }

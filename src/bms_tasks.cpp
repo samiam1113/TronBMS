@@ -38,6 +38,7 @@ static const char *state_name(BmsState s) {
         case BmsState::BALANCE:  return "BALANCE";
         case BmsState::SLEEP:    return "SLEEP";
         case BmsState::FAULT:    return "FAULT";
+        case BmsState::DRIVE:    return "DRIVE";
         default:                 return "UNKNOWN";
     }
 }
@@ -219,19 +220,65 @@ void task_serial(void *pvParameters) {
             while (Serial.available()) Serial.read();
             switch (cmd) {
                 case 'c': {
-                    Serial.println("[serial] CMD: Simulating charge current — forcing CHARGING state.");
-                    BmsState cur = fsm_get_state(g_fsm);
-                    if (cur == BmsState::NORMAL || cur == BmsState::BALANCE) {
-                        if (cur == BmsState::BALANCE) {
-                            balance_stop(&g_meas);
-                            Serial.println("[serial] Balance stopped.");
-                        }
-                        fsm_set_state(g_fsm, BmsState::CHARGING);
-                        Serial.println("[serial] FSM forced to CHARGING.");
-                    } else {
-                        Serial.printf("[serial] Cannot force CHARGING from state %s.\n",
-                                      state_name(cur));
-                    }
+                    Serial.println("[serial] CMD: Force CHARGING — closing CHG gate.");
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+                    fault_clear(static_cast<uint16_t>(Fault::OC_CHG));
+                    fault_clear(static_cast<uint16_t>(Fault::SPI));
+                    g_fsm.fault_reg = 0;
+                    fsm_set_state(g_fsm, BmsState::CHARGING);
+                    break;
+                }
+                case 'd': {
+                    Serial.println("[serial] CMD: Force DRIVE — closing DSG gate.");
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+                    fault_clear(static_cast<uint16_t>(Fault::OC_DSG));
+                    fault_clear(static_cast<uint16_t>(Fault::SPI));
+                    g_fsm.fault_reg = 0;
+                    fsm_set_state(g_fsm, BmsState::DRIVE);
+                    break;
+                }
+                case 'a': {
+                    Serial.println("[serial] CMD: Force NORMAL — clears faults, auto FSM resumes.");
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+                    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+                    fault_clear(static_cast<uint16_t>(Fault::OT));
+                    fault_clear(static_cast<uint16_t>(Fault::OC_CHG));
+                    fault_clear(static_cast<uint16_t>(Fault::OC_DSG));
+                    fault_clear(static_cast<uint16_t>(Fault::SPI));
+                    fault_clear(static_cast<uint16_t>(Fault::ADS_ID));
+                    fault_clear(static_cast<uint16_t>(Fault::GATE));
+                    fault_clear(static_cast<uint16_t>(Fault::TASK_STALL));
+                    g_fsm.fault_reg = 0;
+                    balance_stop(&g_meas);
+                    fsm_set_state(g_fsm, BmsState::NORMAL);
+                    break;
+                }
+                case 'n': {
+                    Serial.println("[serial] CMD: Force NORMAL.");
+                    fsm_set_state(g_fsm, BmsState::NORMAL);
+                    break;
+                }
+                case 'b': {
+                    Serial.println("[serial] CMD: Force BALANCE.");
+                    fsm_set_state(g_fsm, BmsState::BALANCE);
+                    break;
+                }
+                case 's': {
+                    Serial.println("[serial] CMD: Force SLEEP.");
+                    balance_stop(&g_meas);
+                    fsm_set_state(g_fsm, BmsState::SLEEP);
+                    break;
+                }
+                case 'f': {
+                    Serial.println("[serial] CMD: Force FAULT.");
+                    fsm_set_state(g_fsm, BmsState::FAULT);
+                    break;
+                }
+                case 'i': {
+                    Serial.println("[serial] CMD: Force INIT.");
+                    fsm_set_state(g_fsm, BmsState::INIT);
                     break;
                 }
                 case 'x': {
@@ -249,51 +296,28 @@ void task_serial(void *pvParameters) {
                     Serial.printf("[serial] Fault register cleared: 0x%04X\n", fault_get());
                     break;
                 }
-                case 'n': {
-                    Serial.println("[serial] CMD: Forcing NORMAL state.");
-                    fsm_set_state(g_fsm, BmsState::NORMAL);
-                    break;
-                }
-                case 'b': {
-                    Serial.println("[serial] CMD: Forcing BALANCE state.");
-                    fsm_set_state(g_fsm, BmsState::BALANCE);
-                    break;
-                }
-                case 's': {
-                    Serial.println("[serial] CMD: Forcing SLEEP state.");
-                    balance_stop(&g_meas);
-                    fsm_set_state(g_fsm, BmsState::SLEEP);
-                    break;
-                }
-                case 'f': {
-                    Serial.println("[serial] CMD: Forcing FAULT state.");
-                    fsm_set_state(g_fsm, BmsState::FAULT);
-                    break;
-                }
-                case 'i': {
-                    Serial.println("[serial] CMD: Forcing INIT state.");
-                    fsm_set_state(g_fsm, BmsState::INIT);
-                    break;
-                }
                 case '?': {
-                    Serial.println("[serial] Commands:");
-                    Serial.println("[serial]   c = force CHARGING");
-                    Serial.println("[serial]   n = force NORMAL");
+                    Serial.println("[serial] ── Commands ──────────────────────────");
+                    Serial.println("[serial]   c = force CHARGING (closes CHG gate)");
+                    Serial.println("[serial]   d = force DRIVE (closes DSG gate)");
+                    Serial.println("[serial]   a = force NORMAL (clears faults, auto FSM)");
+                    Serial.println("[serial]   n = force NORMAL (no fault clear)");
                     Serial.println("[serial]   b = force BALANCE");
                     Serial.println("[serial]   s = force SLEEP");
                     Serial.println("[serial]   f = force FAULT");
                     Serial.println("[serial]   i = force INIT");
-                    Serial.println("[serial]   x = clear fault register");
+                    Serial.println("[serial]   x = clear fault register only");
                     Serial.println("[serial]   ? = show this help");
+                    Serial.println("[serial] ─────────────────────────────────────");
                     break;
                 }
                 default:
-                    Serial.printf("[serial] Unknown command '%c'. Commands: c=simulate charge\n", cmd);
+                    Serial.printf("[serial] Unknown command '%c' — type ? for help.\n", cmd);
                     break;
             }
         }
 
-        // Stack high-water mark every 10 seconds — OUTSIDE the Serial.available() block
+        // Stack high-water mark every 10 seconds
         static uint32_t s_hwm_ms = 0;
         if ((millis() - s_hwm_ms) >= 10000) {
             s_hwm_ms = millis();
@@ -309,7 +333,6 @@ void task_serial(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
-
 // ============================================================================
 // task_measure
 // ============================================================================
@@ -426,24 +449,14 @@ void task_measure(void *pvParameters) {
 void task_balance(void *pvParameters) {
     Serial.println("[bal] task started — waiting for notify.");
     for (;;) {
-        // Fix #2: block here with ulTaskNotifyTake so the task re-arms itself
-        // for each BALANCE entry without ever calling vTaskSuspend.
-        // vTaskSuspend + xTaskNotifyGive does NOT resume a suspended task —
-        // the notification value increments but the task stays suspended,
-        // silently killing balancing on every re-entry after the first.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Fix #6: reset checkin timestamp on each BALANCE entry so the watchdog
-        // does not see a stale timestamp from the previous balance session and
-        // immediately fire EVT_FAULT_TASK_STALL before the first iteration runs.
         s_wdt_checkin_balance = millis();
 
-        while (fsm_get_state(g_fsm) == BmsState::BALANCE) {
-        Serial.println(); 
+        Serial.println();
         Serial.println("[bal] BALANCE session starting.");
         uint32_t session_start = millis();
         uint32_t iter = 0;
-        s_wdt_checkin_balance = millis();
 
         while (fsm_get_state(g_fsm) == BmsState::BALANCE) {
             s_wdt_checkin_balance = millis();
@@ -461,13 +474,14 @@ void task_balance(void *pvParameters) {
             for (int ic = 0; ic < TOTAL_IC; ic++)
                 for (int c = 0; c < CELLS_PER_IC; c++)
                     if (meas_snap.balance_cells[ic][c]) flagged++;
+
             static uint32_t s_last_bal_print_ms = 0;
-                if ((millis() - s_last_bal_print_ms) >= 5000) {
-                    s_last_bal_print_ms = millis();
-                    Serial.println(); 
-                    Serial.printf("[bal] iter=%lu  flagged=%d  elapsed=%lums\n",
-                        iter, flagged, millis() - session_start);
-                }
+            if ((millis() - s_last_bal_print_ms) >= 5000) {
+                s_last_bal_print_ms = millis();
+                Serial.println();
+                Serial.printf("[bal] iter=%lu  flagged=%d  elapsed=%lums\n",
+                              iter, flagged, millis() - session_start);
+            }
 
             if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 memcpy(g_meas.balance_cells, meas_snap.balance_cells,
@@ -500,11 +514,10 @@ void task_balance(void *pvParameters) {
 
             vTaskDelay(pdMS_TO_TICKS(BAL_REFRESH_MS));
         }
-        Serial.println(); 
+
+        Serial.println();
         Serial.printf("[bal] Session ended  iters=%lu  duration=%lums\n",
                       iter, millis() - session_start);
-        }
-        // No vTaskSuspend here — task loops back to ulTaskNotifyTake and blocks.
     }
 }
 
