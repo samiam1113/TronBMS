@@ -212,7 +212,7 @@ void task_fsm(void *pvParameters) {
 // task_serial — serial command handler
 // ============================================================================
 void task_serial(void *pvParameters) {
-    Serial.println("[serial] Command handler ready. Commands: c=simulate charge  x=clear faults");
+    Serial.println("[serial] Command handler ready. Type ? for help.");
     for (;;) {
         if (Serial.available()) {
             char cmd = Serial.read();
@@ -247,6 +247,44 @@ void task_serial(void *pvParameters) {
                     fault_clear(static_cast<uint16_t>(Fault::TASK_STALL));
                     g_fsm.fault_reg = 0;
                     Serial.printf("[serial] Fault register cleared: 0x%04X\n", fault_get());
+                    break;
+                }
+                case 'n': {
+                    Serial.println("[serial] CMD: Forcing NORMAL state.");
+                    fsm_set_state(g_fsm, BmsState::NORMAL);
+                    break;
+                }
+                case 'b': {
+                    Serial.println("[serial] CMD: Forcing BALANCE state.");
+                    fsm_set_state(g_fsm, BmsState::BALANCE);
+                    break;
+                }
+                case 's': {
+                    Serial.println("[serial] CMD: Forcing SLEEP state.");
+                    balance_stop(&g_meas);
+                    fsm_set_state(g_fsm, BmsState::SLEEP);
+                    break;
+                }
+                case 'f': {
+                    Serial.println("[serial] CMD: Forcing FAULT state.");
+                    fsm_set_state(g_fsm, BmsState::FAULT);
+                    break;
+                }
+                case 'i': {
+                    Serial.println("[serial] CMD: Forcing INIT state.");
+                    fsm_set_state(g_fsm, BmsState::INIT);
+                    break;
+                }
+                case '?': {
+                    Serial.println("[serial] Commands:");
+                    Serial.println("[serial]   c = force CHARGING");
+                    Serial.println("[serial]   n = force NORMAL");
+                    Serial.println("[serial]   b = force BALANCE");
+                    Serial.println("[serial]   s = force SLEEP");
+                    Serial.println("[serial]   f = force FAULT");
+                    Serial.println("[serial]   i = force INIT");
+                    Serial.println("[serial]   x = clear fault register");
+                    Serial.println("[serial]   ? = show this help");
                     break;
                 }
                 default:
