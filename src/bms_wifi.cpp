@@ -20,9 +20,10 @@
 #include "bms_fault.h"
 #include "bms_state.h"
 #include "freertos/semphr.h"
-#include "bms_fault.h"
 #include "bms_fsm.h"
+#include "bms_balance.h"
 extern BmsFsm g_fsm;
+extern measurement_data_t g_meas;
 
 
 // ── AP credentials ─────────────────────────────────────────────────────────
@@ -105,6 +106,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
     main { grid-template-columns: 1fr; }
   }
 
+  
+
   /* ── Cards ── */
   .card { background: var(--surface); border: 1px solid var(--border);
           border-radius: var(--radius); padding: 12px; }
@@ -165,6 +168,15 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
   /* ── Footer ── */
   footer { padding: 6px 18px; font-size: 10px; color: var(--text-dim);
            text-align: right; border-top: 1px solid var(--border); flex-shrink: 0; }
+
+  /* ── Command buttons ── */
+  .cmd-btn {
+  padding: 8px; background: transparent;
+  border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 4px; cursor: pointer; font-family: inherit;
+  font-size: 10px; letter-spacing: 2px;
+  }
+  .cmd-btn:hover { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -238,6 +250,21 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
            font-size:11px;letter-spacing:2px;">
     CLEAR FAULT
   </button>
+</div>
+
+<!-- State control -->
+<div class="card" style="grid-column: 1 / -1;">
+  <div class="card-title">Force State</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;">
+    <button class="cmd-btn" onclick="sendCmd('/cmd/charging')">CHARGING</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/drive')">DRIVE</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/normal_clear')">NORMAL + CLR FAULTS</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/normal')">NORMAL</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/balance')">BALANCE</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/sleep')">SLEEP</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/fault')" style="border-color:var(--danger);color:var(--danger);">FAULT</button>
+    <button class="cmd-btn" onclick="sendCmd('/cmd/init')">INIT</button>
+  </div>
 </div>
 </main>
 
@@ -317,6 +344,11 @@ function fillColor(pct) {
 function clearFault() {
   fetch('/clear_fault', { method: 'POST' })
     .then(r => { if (!r.ok) console.error('Clear failed'); });
+}
+
+function sendCmd(endpoint) {
+  fetch(endpoint, { method: 'POST' })
+    .then(r => { if (!r.ok) console.error('Command failed'); });
 }
 
 function applyData(d) {
@@ -545,14 +577,78 @@ void wifi_server_init(void)
     });
 
     s_server.on("/clear_fault", HTTP_POST, [](AsyncWebServerRequest *req) {
-    fault_clear(static_cast<uint16_t>(FaultCode::OVERVOLTAGE));
-    fault_clear(static_cast<uint16_t>(FaultCode::UNDERVOLTAGE));
-    fault_clear(static_cast<uint16_t>(FaultCode::OVERCURRENT));
-    fault_clear(static_cast<uint16_t>(FaultCode::OVERTEMP));
-    fault_clear(static_cast<uint16_t>(FaultCode::BAL_OVERTEMP));
-    fault_clear(static_cast<uint16_t>(FaultCode::SPI_LTC));
-    fault_clear(static_cast<uint16_t>(FaultCode::SPI_ADS));
-    fault_clear(static_cast<uint16_t>(FaultCode::STARTUP));
+    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+    fault_clear(static_cast<uint16_t>(Fault::OT));
+    fault_clear(static_cast<uint16_t>(Fault::OC_CHG));
+    fault_clear(static_cast<uint16_t>(Fault::OC_DSG));
+    fault_clear(static_cast<uint16_t>(Fault::SPI));
+    fault_clear(static_cast<uint16_t>(Fault::ADS_ID));
+    fault_clear(static_cast<uint16_t>(Fault::GATE));
+    fault_clear(static_cast<uint16_t>(Fault::TASK_STALL));
+    g_fsm.fault_reg = 0;
+    fsm_set_state(g_fsm, BmsState::INIT);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/charging", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+    fault_clear(static_cast<uint16_t>(Fault::OC_CHG));
+    fault_clear(static_cast<uint16_t>(Fault::SPI));
+    g_fsm.fault_reg = 0;
+    fsm_set_state(g_fsm, BmsState::CHARGING);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/drive", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+    fault_clear(static_cast<uint16_t>(Fault::OC_DSG));
+    fault_clear(static_cast<uint16_t>(Fault::SPI));
+    g_fsm.fault_reg = 0;
+    fsm_set_state(g_fsm, BmsState::DRIVE);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/normal_clear", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fault_clear(static_cast<uint16_t>(Fault::CELL_OV));
+    fault_clear(static_cast<uint16_t>(Fault::CELL_UV));
+    fault_clear(static_cast<uint16_t>(Fault::OT));
+    fault_clear(static_cast<uint16_t>(Fault::OC_CHG));
+    fault_clear(static_cast<uint16_t>(Fault::OC_DSG));
+    fault_clear(static_cast<uint16_t>(Fault::SPI));
+    fault_clear(static_cast<uint16_t>(Fault::ADS_ID));
+    fault_clear(static_cast<uint16_t>(Fault::GATE));
+    fault_clear(static_cast<uint16_t>(Fault::TASK_STALL));
+    g_fsm.fault_reg = 0;
+    balance_stop(&g_meas);
+    fsm_set_state(g_fsm, BmsState::NORMAL);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/normal", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fsm_set_state(g_fsm, BmsState::NORMAL);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/balance", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fsm_set_state(g_fsm, BmsState::BALANCE);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/sleep", HTTP_POST, [](AsyncWebServerRequest *req) {
+    balance_stop(&g_meas);
+    fsm_set_state(g_fsm, BmsState::SLEEP);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/fault", HTTP_POST, [](AsyncWebServerRequest *req) {
+    fsm_set_state(g_fsm, BmsState::FAULT);
+    req->send(200, "text/plain", "OK");
+});
+
+s_server.on("/cmd/init", HTTP_POST, [](AsyncWebServerRequest *req) {
     fsm_set_state(g_fsm, BmsState::INIT);
     req->send(200, "text/plain", "OK");
 });
