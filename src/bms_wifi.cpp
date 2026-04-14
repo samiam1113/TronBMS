@@ -290,7 +290,7 @@ const FAULT_NAMES = [
   'Startup',
 ];
 
-const STATE_NAMES = ['INIT','STARTUP','NORMAL','BALANCE','SLEEP','FAULT'];
+const STATE_NAMES = ['INIT','STARTUP','NORMAL','BALANCE','SLEEP','FAULT','CHARGING', 'DRIVE'];
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
 const $dot       = document.getElementById('status-dot');
