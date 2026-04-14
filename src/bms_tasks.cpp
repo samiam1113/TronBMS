@@ -307,8 +307,32 @@ void task_serial(void *pvParameters) {
                     Serial.println("[serial]   f = force FAULT");
                     Serial.println("[serial]   i = force INIT");
                     Serial.println("[serial]   x = clear fault register only");
+                    Serial.println("[serial]   o = toggle CHG gate open/close");
+                    Serial.println("[serial]   p = toggle DSG gate open/close");
                     Serial.println("[serial]   ? = show this help");
                     Serial.println("[serial] ─────────────────────────────────────");
+                    break;
+                }
+                case 'o': {
+                    g_fsm.chg_open = !g_fsm.chg_open;
+                    if (g_fsm.chg_open) {
+                        digitalWrite(GATE_CHG_PIN, LOW);
+                        Serial.printf("[serial] CMD: CHG gate OPENED  (GATE_CHG_PIN=%d LOW)\n", GATE_CHG_PIN);
+                    } else {
+                        digitalWrite(GATE_CHG_PIN, HIGH);
+                        Serial.printf("[serial] CMD: CHG gate CLOSED  (GATE_CHG_PIN=%d HIGH)\n", GATE_CHG_PIN);
+                    }
+                    break;
+                }
+                case 'p': {
+                    g_fsm.dsg_open = !g_fsm.dsg_open;
+                    if (g_fsm.dsg_open) {
+                        digitalWrite(GATE_DSCHG_PIN, LOW);
+                        Serial.printf("[serial] CMD: DSG gate OPENED  (GATE_DSCHG_PIN=%d LOW)\n", GATE_DSCHG_PIN);
+                    } else {
+                        digitalWrite(GATE_DSCHG_PIN, HIGH);
+                        Serial.printf("[serial] CMD: DSG gate CLOSED  (GATE_DSCHG_PIN=%d HIGH)\n", GATE_DSCHG_PIN);
+                    }
                     break;
                 }
                 default:
