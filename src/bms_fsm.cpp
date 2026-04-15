@@ -228,13 +228,10 @@ static bool charging_needs_gate_open_balance(const measurement_data_t &meas) {
 // ----------------------------------------------------------------------------
 static void state_init(BmsFsm &fsm) {
     ltc_wakeup_sleep();
-
-    ads_reset();
-vTaskDelay(pdMS_TO_TICKS(10));  // let ADS settle after reset
-
+    vTaskDelay(pdMS_TO_TICKS(10));
+    //ads_reset(); ADS131M02 Disabled, hardware issue
     fsm_set_state(fsm, BmsState::STARTUP);
 }
-
 // ----------------------------------------------------------------------------
 // STARTUP — full self-test sequence
 // ----------------------------------------------------------------------------
@@ -279,10 +276,11 @@ static void state_normal(BmsFsm &fsm) {
         return;
     }
 
-    if ((millis() - fsm.last_activity_ms) >= SLEEP_IDLE_TIMEOUT_MS) {
-        fsm_set_state(fsm, BmsState::SLEEP);
-        return;
-    }
+    // ADS disabled — idle timeout suspended
+    // if ((millis() - fsm.last_activity_ms) >= SLEEP_IDLE_TIMEOUT_MS) {
+    //     fsm_set_state(fsm, BmsState::SLEEP);
+    //     return;
+    // }
 
     if (!balance_satisfied(&meas)) {
         fsm_set_state(fsm, BmsState::BALANCE);
@@ -372,18 +370,11 @@ static void state_charging(BmsFsm &fsm) {
     // ── Normal charging phase ─────────────────────────────────────────────────
 
     // Check if charger has been removed
-    const float amps = meas_snap.current_a;
-    if (amps > 999.0f) {
-        Serial.println("[chg] Charger removed — transitioning to SLEEP.");
-        balance_stop(&meas_snap);
-        if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            memcpy(g_meas.balance_cells, meas_snap.balance_cells,
-                   sizeof(g_meas.balance_cells));
-            xSemaphoreGive(g_meas_mutex);
-        }
-        fsm_set_state(fsm, BmsState::SLEEP);
-        return;
-    }
+    // ADS disabled — charger removed check suspended
+    // if (amps > -0.5f) {
+    //     fsm_set_state(fsm, BmsState::SLEEP);
+    //     return;
+    // }
 
     // Emergency: spread >= 75mV → open gate immediately and drain
     if (spread >= CHG_EMERGENCY_DELTA_V) {
@@ -459,13 +450,8 @@ static void state_balance(BmsFsm &fsm) {
 // SLEEP — LTC asleep, poll ADS131 current for wakeup
 // ----------------------------------------------------------------------------
 static void state_sleep(BmsFsm &fsm) {
-    if ((millis() - fsm.state_entry_ms) < 3000) return;
-
-    const float amps = ads_read_current();
-    if (amps > 1.0f || amps < -1.0f) {
-        fsm.last_activity_ms = millis();
-        fsm_set_state(fsm, BmsState::INIT);
-    }
+    // ADS disabled — sleep indefinitely until manually woken via serial command
+    // Use 'a' command to return to NORMAL
 }
 
 // ----------------------------------------------------------------------------
@@ -494,11 +480,11 @@ static void state_drive(BmsFsm &fsm) {
         return;
     }
 
-    // Return to NORMAL when no discharge current
-    if (meas_snap.current_a < 0.5f) {
-        fsm_set_state(fsm, BmsState::NORMAL);
-        return;
-    }
+    // ADS disabled — current check suspended
+    // if (meas_snap.current_a < 0.5f) {
+    //     fsm_set_state(fsm, BmsState::NORMAL);
+    //     return;
+    // }
 
     // Update activity timestamp
     fsm.last_activity_ms = millis();

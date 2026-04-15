@@ -122,7 +122,8 @@ float ads_counts_to_amps(int32_t raw) {
 }
 
 float ads_read_current() {
-  return ads_counts_to_amps(ads_read_raw());
+  //return ads_counts_to_amps(ads_read_raw());
+  return 0.0f; //ADS131M02 Disabled, hardware issue
 }
 
 // ============================================================================
