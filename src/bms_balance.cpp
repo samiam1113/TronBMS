@@ -113,9 +113,6 @@ bool balance_satisfied(const measurement_data_t *meas) {
         }
 
     float delta = max_v - min_v;
-    Serial.printf("[bal] Delta: %.1fmV — %s\n",
-                  delta * 1000.0f,
-                  delta < (BAL_THRESHOLD_UV * 0.0001f) ? "SATISFIED" : "balancing");
     return delta < (BAL_THRESHOLD_UV * 0.0001f);
 }
 
