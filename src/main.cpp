@@ -82,6 +82,18 @@ void setup() {
     ltc_wakeup_sleep();
     ltc_wakeup_idle();
     Serial.println("[main] LTC chain wakeup sent.");
+    
+    // ── Pre-warm temperature sensors ──────────────────────────────────────────
+    // Thermistors require several LTC ADC cycles to stabilize on first power-up.
+    // Poll them repeatedly here so they read correctly from the first FSM tick.
+    Serial.println("[main] Pre-warming temperature sensors...");
+    for (int i = 0; i < 20; i++) {
+        ltc_wakeup_idle();
+        measurement_data_t dummy = {};
+        meas_cell_data(&dummy);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    Serial.println("[main] Temperature sensors ready.");
 
     // ── RTOS primitives ───────────────────────────────────────────────────────
     g_event_group    = xEventGroupCreate();
