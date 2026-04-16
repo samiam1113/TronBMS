@@ -475,6 +475,17 @@ static void state_drive(BmsFsm &fsm) {
 
     contactors_update(fsm);
 
+    // Fault if cell spread exceeds 150mV during drive
+    float vmin, vmax;
+    pack_min_max(meas_snap, vmin, vmax);
+    if ((vmax - vmin) >= 0.150f) {
+        Serial.printf("[drive] FAULT: cell spread %.1fmV >= 150mV — opening gates.\n",
+                      (vmax - vmin) * 1000.0f);
+        fsm_fault_set(fsm, Fault::CELL_UV);
+        fsm_set_state(fsm, BmsState::FAULT);
+        return;
+    }
+
     if (fsm.fault_reg != 0) {
         fsm_set_state(fsm, BmsState::FAULT);
         return;
