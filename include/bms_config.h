@@ -37,7 +37,7 @@
 #define CURR_PEAK_MS        1000    // Peak current allowed duration (ms)
 
 // ── Cell balancing ────────────────────────────────────────────────────────────
-#define BAL_THRESHOLD_UV    200u    // Balance if max-min delta >= 2 mV (200 counts)
+#define BAL_THRESHOLD_UV    150u    // Balance if max-min delta >= 2 mV (200 counts)
 #define CELL_IMBALANCE_THRESHOLD_V 0.001f;  // 50 mV imbalance threshold
 
 // ── ADS131M02-Q1 current sensing ──────────────────────────────────────────────

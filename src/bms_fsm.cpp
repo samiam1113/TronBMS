@@ -60,7 +60,7 @@
 static constexpr float CHG_CELL_TARGET_V       = 4.100f;  // Full charge target per cell
 static constexpr float CHG_DONE_WINDOW_V       = 0.003f;  // All within 3mV of 4.1V = done
 static constexpr float CHG_BAL_START_V         = 3.800f;  // Min cell voltage to start balancing
-static constexpr float CHG_BAL_DELTA_V         = 0.025f;  // 25mV above lowest triggers balance
+static constexpr float CHG_BAL_DELTA_V         = 0.020f;  // 20mV above lowest triggers balance
 static constexpr float CHG_EMERGENCY_DELTA_V   = 0.075f;  // 75mV spread → emergency gate open
 static constexpr float CHG_DRAIN_DONE_V        = 0.003f;  // Drain until within 3mV of lowest
 static constexpr float CHG_GATE_OPEN_DELTA_V   = 0.025f;  // Gate open threshold when cell at 4.1V
