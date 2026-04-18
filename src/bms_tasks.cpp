@@ -391,7 +391,32 @@ void task_measure(void *pvParameters) {
             xEventGroupSetBits(g_event_group, EVT_FAULT_LTC);
             continue;
         }
+        // ── 10-sample rolling average for cell voltages ───────────────────────────
+        #define AVG_SAMPLES 10
+        static float avg_buf[TOTAL_IC][CELLS_PER_IC][AVG_SAMPLES] = {};
+        static int   avg_idx = 0;
+        static bool  avg_full = false;
 
+        for (int ic = 0; ic < TOTAL_IC; ic++)
+            for (int c = 0; c < CELLS_PER_IC; c++)
+                avg_buf[ic][c][avg_idx] = meas.cell_v[ic][c];
+
+        avg_idx++;
+        if (avg_idx >= AVG_SAMPLES) {
+            avg_idx = 0;
+            avg_full = true;
+        }
+
+        if (avg_full) {
+            for (int ic = 0; ic < TOTAL_IC; ic++) {
+                for (int c = 0; c < CELLS_PER_IC; c++) {
+                    float sum = 0.0f;
+                    for (int s = 0; s < AVG_SAMPLES; s++)
+                        sum += avg_buf[ic][c][s];
+                    meas.cell_v[ic][c] = sum / AVG_SAMPLES;
+                }
+            }
+        }
         // Publish to g_meas and the DAQ queue under mutex
         if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             g_meas = meas;
