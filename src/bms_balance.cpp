@@ -83,7 +83,7 @@ void balance_compute_mask(measurement_data_t *meas) {
                 // Not currently balancing — check if newly eligible
                 if (v > trigger_threshold) {
                     meas->balance_cells[ic][c] = true;
-                    s_bal_target_v[ic][c] = min_v + 0.010f;
+                    s_bal_target_v[ic][c] = min_v + 0.003f;
                     Serial.printf("[bal] IC%d-C%02d newly flagged: %.4fV > min %.4fV + threshold, target=%.4fV\n",
                                   ic+1, c+1, v, min_v, s_bal_target_v[ic][c]);
                 }
