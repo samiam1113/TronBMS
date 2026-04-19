@@ -598,17 +598,23 @@ void task_balance(void *pvParameters) {
                            sizeof(g_meas.balance_cells));
                     xSemaphoreGive(g_meas_mutex);
                 }
-                vTaskDelay(pdMS_TO_TICKS(30000)); // wait 30s before retrying
+                for (int t = 0; t < 2; t++) {
+                    s_wdt_checkin_balance = millis();
+                    vTaskDelay(pdMS_TO_TICKS(30000));
+                }
                 break;
             }
 
-            // Balance ON for 10 minutes
-            vTaskDelay(pdMS_TO_TICKS(600000));
+            // Balance ON for 10 minutes — checkin every 30s to feed watchdog
+            for (int t = 0; t < 20; t++) {
+                s_wdt_checkin_balance = millis();
+                vTaskDelay(pdMS_TO_TICKS(30000));
+            }
 
             // Pause — longer if warm
-            uint32_t cool_ms = 120000; //2 minutes default
-            if (tmax >= 40.0f) cool_ms = 300000; //5 minutes if warm
-            if (tmax >= 45.0f) cool_ms = 600000; //10 minutes if hot
+            uint32_t cool_ms = 120000;
+            if (tmax >= 40.0f) cool_ms = 300000;
+            if (tmax >= 45.0f) cool_ms = 600000;
 
             Serial.printf("[bal] Cooling pause %lums  Tmax=%.1f°C\n", cool_ms, tmax);
             balance_stop(&meas_snap);
@@ -617,7 +623,11 @@ void task_balance(void *pvParameters) {
                        sizeof(g_meas.balance_cells));
                 xSemaphoreGive(g_meas_mutex);
             }
-            vTaskDelay(pdMS_TO_TICKS(cool_ms));
+            uint32_t cool_chunks = cool_ms / 30000;
+            for (uint32_t t = 0; t <= cool_chunks; t++) {
+                s_wdt_checkin_balance = millis();
+                vTaskDelay(pdMS_TO_TICKS(30000));
+            }
         }
 
         Serial.println();
@@ -687,7 +697,7 @@ void task_watchdog(void *pvParameters) {
             xEventGroupSetBits(g_event_group, EVT_FAULT_TASK_STALL);
         }
         if (fsm_get_state(g_fsm) == BmsState::BALANCE) {
-            if ((now - s_wdt_checkin_balance) > (BAL_REFRESH_MS * 2)) {
+            if ((now - s_wdt_checkin_balance) > 660000) {  // 11 minutes
                 Serial.printf("[wdt] task_balance STALL  last=%lums ago\n",
                               now - s_wdt_checkin_balance);
                 xEventGroupSetBits(g_event_group, EVT_FAULT_TASK_STALL);
