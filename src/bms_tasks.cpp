@@ -583,7 +583,41 @@ void task_balance(void *pvParameters) {
                 break;
             }
 
-            vTaskDelay(pdMS_TO_TICKS(BAL_REFRESH_MS));
+            // ── Thermal-aware balance duty cycle ─────────────────────────
+            float tmax = -99.0f;
+            for (int i = 0; i < NUM_TEMP_SENSORS; i++)
+                if (meas_snap.temps[i] > -50.0f && meas_snap.temps[i] > tmax)
+                    tmax = meas_snap.temps[i];
+
+            // Hard stop above 50C
+            if (tmax >= 50.0f) {
+                Serial.printf("[bal] TEMP PAUSE: %.1f°C >= 50°C — stopping balance.\n", tmax);
+                balance_stop(&meas_snap);
+                if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                           sizeof(g_meas.balance_cells));
+                    xSemaphoreGive(g_meas_mutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(30000)); // wait 30s before retrying
+                break;
+            }
+
+            // Balance ON for 10 seconds
+            vTaskDelay(pdMS_TO_TICKS(10000));
+
+            // Pause — longer if warm
+            uint32_t cool_ms = 2000;
+            if (tmax >= 40.0f) cool_ms = 5000;
+            if (tmax >= 45.0f) cool_ms = 10000;
+
+            Serial.printf("[bal] Cooling pause %lums  Tmax=%.1f°C\n", cool_ms, tmax);
+            balance_stop(&meas_snap);
+            if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                memcpy(g_meas.balance_cells, meas_snap.balance_cells,
+                       sizeof(g_meas.balance_cells));
+                xSemaphoreGive(g_meas_mutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(cool_ms));
         }
 
         Serial.println();

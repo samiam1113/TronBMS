@@ -127,10 +127,9 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
         return LTC_OK;
     }
 
-    // Cell index to LTC DCC bit mapping — skips C6 (index 5+ shifted by 1)
     static const uint8_t cell_to_dcc_bit[CELLS_PER_IC] = {
-        0, 1, 2, 3, 4,   // cell 0-4 → LTC C1-C5 → DCC bits 0-4
-        6, 7, 8, 9, 10   // cell 5-9 → LTC C7-C11 → DCC bits 6-10
+        0, 1, 2, 3, 4,
+        6, 7, 8, 9, 10
     };
 
     uint16_t dcc[TOTAL_IC] = {};
@@ -142,8 +141,6 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
         }
     }
 
-    // Fix #8: read the current LTC config so we can preserve the GPIO
-    // pull-down bits that ltc_read_temperatures relies on.
     LtcConfig live[TOTAL_IC];
     bool gpio_pd[5] = {false, false, false, false, false};
     if (ltc_read_config(live)) {
@@ -152,16 +149,10 @@ ltc_status_t balance_apply(const measurement_data_t *meas) {
         Serial.println("[bal] balance_apply: ltc_read_config failed — GPIO pull-downs set to false");
     }
 
-LtcConfig cfg[TOTAL_IC];
+    LtcConfig cfg[TOTAL_IC];
     build_safe_config(cfg, dcc[0], dcc[1], gpio_pd);
     ltc_write_config(cfg);
 
-    ltc_write_config(cfg);
-    uint32_t t1 = millis();
-    LtcConfig verify[TOTAL_IC];
-    if (ltc_read_config(verify)) {
-        uint32_t t2 = millis();
-    }
     return LTC_OK;
 }
 
@@ -187,6 +178,4 @@ void balance_stop(measurement_data_t *meas) {
     LtcConfig cfg[TOTAL_IC];
     build_safe_config(cfg, 0x0000, 0x0000, gpio_pd_off);
     ltc_write_config(cfg);
-
-    Serial.println("[bal] balance_stop() — all DCC bits cleared");
 }
