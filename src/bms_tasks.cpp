@@ -602,13 +602,13 @@ void task_balance(void *pvParameters) {
                 break;
             }
 
-            // Balance ON for 10 seconds
-            vTaskDelay(pdMS_TO_TICKS(10000));
+            // Balance ON for 10 minutes
+            vTaskDelay(pdMS_TO_TICKS(600000));
 
             // Pause — longer if warm
-            uint32_t cool_ms = 2000;
-            if (tmax >= 40.0f) cool_ms = 5000;
-            if (tmax >= 45.0f) cool_ms = 10000;
+            uint32_t cool_ms = 120000; //2 minutes default
+            if (tmax >= 40.0f) cool_ms = 300000; //5 minutes if warm
+            if (tmax >= 45.0f) cool_ms = 600000; //10 minutes if hot
 
             Serial.printf("[bal] Cooling pause %lums  Tmax=%.1f°C\n", cool_ms, tmax);
             balance_stop(&meas_snap);
