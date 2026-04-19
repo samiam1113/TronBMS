@@ -375,23 +375,32 @@ void task_measure(void *pvParameters) {
 
         ltc_wakeup_idle();
 
-        // Take a local snapshot of g_meas to work with, then write back
+        // Snapshot current balance mask before stopping
         measurement_data_t meas = {};
-
-        // Copy current balance mask in so ltc_read_voltages can apply it
+        measurement_data_t bal_snap = {};
         if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            bal_snap = g_meas;
             memcpy(meas.balance_cells, g_meas.balance_cells,
                    sizeof(meas.balance_cells));
             xSemaphoreGive(g_meas_mutex);
         }
 
+        // Stop balancing during measurement to avoid tap noise
+        balance_stop(nullptr);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
         // Read all measurements into local meas struct
         if (!meas_cell_data(&meas)) {
             Serial.println("[meas] ERROR: SPI read failed.");
+            // Restore balance before continuing
+            if (fsm_get_state(g_fsm) == BmsState::BALANCE) {
+                balance_apply(&bal_snap);
+            }
             xEventGroupSetBits(g_event_group, EVT_FAULT_LTC);
             continue;
         }
-        // ── 10-sample rolling average for cell voltages ───────────────────────────
+
+        // ── 10-sample rolling average for cell voltages ───────────────────
         #define AVG_SAMPLES 10
         static float avg_buf[TOTAL_IC][CELLS_PER_IC][AVG_SAMPLES] = {};
         static int   avg_idx = 0;
@@ -417,12 +426,14 @@ void task_measure(void *pvParameters) {
                 }
             }
         }
-        // Publish to g_meas and the DAQ queue under mutex
+
+        // Publish to g_meas
         if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             g_meas = meas;
             xSemaphoreGive(g_meas_mutex);
         }
 
+        // Send to DAQ queue
         if (xQueueSend(g_meas_queue, &meas, 0) == errQUEUE_FULL) {
             measurement_data_t discard;
             xQueueReceive(g_meas_queue, &discard, 0);
@@ -430,7 +441,18 @@ void task_measure(void *pvParameters) {
             Serial.println("[meas] WARN: DAQ queue full — frame dropped.");
         }
 
-        // OV check — print each offending cell
+        // Restore balance mask and re-apply DCC bits
+        if (xSemaphoreTake(g_meas_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            memcpy(g_meas.balance_cells, bal_snap.balance_cells,
+                   sizeof(g_meas.balance_cells));
+            xSemaphoreGive(g_meas_mutex);
+        }
+        if (fsm_get_state(g_fsm) == BmsState::BALANCE) {
+            balance_apply(&g_meas);
+        }
+
+        // ── Protection checks ─────────────────────────────────────────────
+        // OV check
         bool ov = false;
         for (int ic = 0; ic < TOTAL_IC; ic++)
             for (int c = 0; c < CELLS_PER_IC; c++)
@@ -441,7 +463,7 @@ void task_measure(void *pvParameters) {
                 }
         if (ov) xEventGroupSetBits(g_event_group, EVT_FAULT_OV);
 
-        // UV check — print each offending cell
+        // UV check
         bool uv = false;
         for (int ic = 0; ic < TOTAL_IC; ic++)
             for (int c = 0; c < CELLS_PER_IC; c++)
@@ -466,12 +488,11 @@ void task_measure(void *pvParameters) {
             xEventGroupSetBits(g_event_group, EVT_FAULT_OT);
         }
 
-        // ── Sleep idle timeout — reset activity timestamp on any real current ─
-        // 0.5 A deadband filters ADC noise so a resting pack doesn't stay awake.
-        // g_fsm.last_activity_ms is read by state_normal() to gate sleep entry.
+        // Activity timestamp
         if (meas.current_a > 0.5f || meas.current_a < -0.5f) {
             g_fsm.last_activity_ms = millis();
         }
+
         // Current direction change
         if ((s_last_current > -0.5f) && (meas.current_a < -0.5f))
             Serial.printf("[meas] → CHARGING  I=%.3fA\n", meas.current_a);
@@ -481,13 +502,14 @@ void task_measure(void *pvParameters) {
             Serial.printf("[meas] → DISCHARGING  I=%.3fA\n", meas.current_a);
         s_last_current = meas.current_a;
 
-        // Throttled pack summary every 1 second
+        // Throttled pack summary every 5 seconds
         BmsState cur_state = fsm_get_state(g_fsm);
         if (cur_state != s_last_state || (millis() - s_last_print_ms) >= 5000) {
             s_last_print_ms = millis();
             s_last_state = cur_state;
             print_pack_summary(meas, cur_state);
         }
+
         s_wdt_checkin_measure = millis();
     }
 }
