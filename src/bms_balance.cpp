@@ -57,6 +57,11 @@ static void build_safe_config(LtcConfig cfg[2],
 static float s_bal_target_v[TOTAL_IC][CELLS_PER_IC] = {};
 static bool  s_bal_target_set = false;
 
+void balance_reset_targets() {
+    s_bal_target_set = false;
+    memset(s_bal_target_v, 0, sizeof(s_bal_target_v));
+}
+
 void balance_compute_mask(measurement_data_t *meas) {
     // Find global minimum
     float min_v = meas->cell_v[0][0];

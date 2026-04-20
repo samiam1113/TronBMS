@@ -626,8 +626,12 @@ void task_balance(void *pvParameters) {
             uint32_t cool_chunks = cool_ms / 30000;
             for (uint32_t t = 0; t <= cool_chunks; t++) {
                 s_wdt_checkin_balance = millis();
+                Serial.printf("[bal] COOLDOWN: %lu/%lu min elapsed  Tmax=%.1f°C\n",
+                              t * 30000 / 60000, cool_ms / 60000, tmax);
                 vTaskDelay(pdMS_TO_TICKS(30000));
             }
+            balance_reset_targets();
+            Serial.println("[bal] Cooldown complete — resuming balance.");
         }
 
         Serial.println();
