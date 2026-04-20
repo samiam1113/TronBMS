@@ -4,6 +4,7 @@
 #include "bms_types.h"
 #include "bms_config.h"
 
+
 // ============================================================================
 // bms_balance.h — Cell balancing API
 //
@@ -44,5 +45,7 @@ ltc_status_t balance_apply(const measurement_data_t *meas);
  * Safe to call with meas == nullptr (skips the struct clear, still writes LTC).
  */
 void balance_stop(measurement_data_t *meas);
+
+void balance_reset_targets();
 
 #endif // BMS_BALANCE_H
